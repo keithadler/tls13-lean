@@ -2000,7 +2000,8 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
         next.expectedClientFinished? =
           some (HaclStar.hmacSha256
             (Spec.finishedKey H (Spec.derived H inp .cHsTraffic))
-            (inp.hash .serverFinished)) := by
+            (inp.hash .serverFinished)) ∧
+        next.exporterMasterSecret? = some (Spec.derived H inp .expMaster) := by
   unfold completeClientHello at h
   simp only [pure_bind] at h
   obtain ⟨exchanged, _, h⟩ := except_bind_ok_inv h
@@ -2035,6 +2036,12 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
         (Spec.derived H inp .sApTraffic) ∧
       Record.TrafficKeys.DerivedFrom H clientApplicationKeys
         (Spec.derived H inp .cApTraffic) ∧
+      deriveSecret (masterSecret (handshakeSecret earlySecret sharedSecret
+          (HaclStar.sha256 ByteArray.empty)) (HaclStar.sha256 ByteArray.empty)) "exp master"
+          (HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
+            encryptedExtensions.encoded ++ requestBytes ++ certificate.encoded ++
+            certVerify.encoded ++ serverFinished.encoded)) =
+        Spec.derived H inp .expMaster ∧
       finishedVerifyData
           (deriveSecret (handshakeSecret earlySecret sharedSecret
             (HaclStar.sha256 ByteArray.empty)) "c hs traffic"
@@ -2050,7 +2057,7 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
     have hms := masterSecret_node_spec hi inp hhs hempty
     have hsap := deriveSecret_node_spec hi inp .sApTraffic hms hfin
     have hcap := deriveSecret_node_spec hi inp .cApTraffic hms hfin
-    refine ⟨?_, ?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, deriveSecret_node_spec hi inp .expMaster hms hfin, ?_⟩
     · rw [← hchs]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hcrk)
     · rw [← hsap]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hsak)
     · rw [← hcap]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hcak)
@@ -2061,13 +2068,36 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
         hchs
   refine ⟨sharedSecret, requestBytes, serverHello, encryptedExtensions, certificate, certVerify,
     serverFinished, eq_of_beq hsize, fun inp h1 h2 h3 h4 h5 => ?_⟩
-  obtain ⟨a, b, c, d⟩ := hderiv inp h1 h2 h3 h4 h5
+  obtain ⟨a, b, c, e, d⟩ := hderiv inp h1 h2 h3 h4 h5
   split at h
   · cases h
-    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d⟩
+    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d, congrArg some e⟩
   · obtain ⟨ccsWire, _, h⟩ := except_bind_ok_inv h
     cases h
-    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d⟩
+    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d, congrArg some e⟩
+
+/-- **The exporter is RFC 9846 §7.5's `TLS-Exporter`** over the connection's
+stored exporter master secret, which `completeClientHello_keySchedule` shows is
+§7.1's `exporter_master_secret`. -/
+theorem exportKeyingMaterial_spec {H : Spec.Hkdf} (hi : Implements H)
+    {state : State} {label context out : ByteArray} {length : Nat}
+    (h : exportKeyingMaterial state label context length = .ok out) :
+    ∃ secret, state.exporterMasterSecret? = some secret ∧
+      out = Spec.exporter H secret label (HaclStar.sha256 ByteArray.empty)
+        (HaclStar.sha256 context) length := by
+  unfold exportKeyingMaterial at h
+  simp only [pure_bind] at h
+  obtain ⟨_, h⟩ := unless_ok h
+  cases hr : exporterRequestError? label length with
+  | some m => rw [hr] at h; cases h
+  | none =>
+    rw [hr] at h
+    cases hs : state.exporterMasterSecret? with
+    | none => rw [hs] at h; cases h
+    | some secret =>
+      rw [hs] at h
+      cases h
+      exact ⟨secret, rfl, exporter_spec hi _ _ _ _ _⟩
 
 /-- **A KeyUpdate installs the RFC 8446 §7.2 successor epoch.** The new read
 epoch's secret is `HKDF-Expand-Label(old, "traffic upd", "", Hash.length)` —

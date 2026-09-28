@@ -16,6 +16,10 @@
 #   6. go crypto/tls GET restricted to {X25519MLKEM768, P-256} so the only
 #      first-flight share is one the server does not implement -> HRR to P-256
 #
+# The openssl exporter case and go-default also require the RFC 9846 §7.5
+# keying material each client exports ("EXPERIMENTAL-tls13-lean", no context,
+# 32 bytes) to equal the server's EXPORTER line.
+#
 # openssl and curl are required on PATH. The Go cases are skipped with a
 # notice when no `go` binary is available (e.g. run
 # `nix shell nixpkgs#go -c bazel test //Test:external_interop_test ...`).
@@ -130,6 +134,13 @@ server_negotiated() {
   grep -q "^NEGOTIATED " "${SERVER_LOG}"
 }
 
+# The server's exported keying material equals the client's ($1, hex).
+exporter_matches() {
+  local server_hex
+  server_hex="$(sed -n 's/^EXPORTER //p' "${SERVER_LOG}")"
+  [[ -n "${server_hex}" && -n "${1:-}" && "${server_hex^^}" == "${1^^}" ]]
+}
+
 server_saw_hrr() {
   grep -q "waitingSecondClientHello" "${SERVER_LOG}"
 }
@@ -175,6 +186,28 @@ if run_openssl openssl-hrr -groups P-384:X25519; then
     fail "openssl-hrr: handshake completed without exercising HelloRetryRequest"
   fi
 fi
+
+# --- Case 2b: RFC 9846 §7.5 exported keying material agrees with OpenSSL. ---
+run_openssl_exporter() {
+  local name=openssl-exporter
+  local log="${WORK}/${name}.log"
+  start_server
+  timeout 30 openssl s_client -connect "127.0.0.1:${PORT}" -tls1_3 \
+    -CAfile "${CERT}" -servername localhost -verify_return_error \
+    -keymatexport EXPERIMENTAL-tls13-lean -keymatexportlen 32 \
+    </dev/null >"${log}" 2>&1
+  local rc=$?
+  finish_server
+  local client_hex
+  client_hex="$(sed -n 's/^ *Keying material: //p' "${log}")"
+  if [[ ${rc} -ne 0 ]] || ! server_negotiated || ! exporter_matches "${client_hex}"; then
+    dump_case "${name}" "${log}"
+    fail "${name}: exported keying material differs (openssl=${client_hex:-none}, server=$(sed -n 's/^EXPORTER //p' "${SERVER_LOG}"))"
+    return 1
+  fi
+  note "PASS openssl keying material exporter (${client_hex})"
+}
+run_openssl_exporter
 
 # --- Case 3/4: curl fetches the page (default and 7-byte transport reads). ---
 run_curl() {
@@ -227,7 +260,13 @@ if [[ -n "${GO_SRC}" ]] && command -v go >/dev/null; then
   }
 
   if run_go go-default; then
-    note "PASS go crypto/tls default ($(grep '^NEGOTIATED' "${SERVER_LOG}"))"
+    go_hex="$(sed -n 's/^GO-EXPORTER //p' "${WORK}/go-default.log")"
+    if exporter_matches "${go_hex}"; then
+      note "PASS go crypto/tls default ($(grep '^NEGOTIATED' "${SERVER_LOG}"), exporter ${go_hex})"
+    else
+      dump_case go-default "${WORK}/go-default.log"
+      fail "go-default: exported keying material differs (go=${go_hex:-none})"
+    fi
   fi
   if run_go go-hrr -hrr; then
     if server_saw_hrr; then

@@ -188,5 +188,18 @@ theorem deriveSecret_node_spec {H : Spec.Hkdf} (hi : Implements H)
   rw [hparent, ← hhash]
   exact derived_spec hi inp d
 
+/-! ## Exporters -/
+
+/-- **`exporter` is RFC 9846 §7.5's `TLS-Exporter`**: a `Derive-Secret` under
+the application's label over `Hash("")`, then `HKDF-Expand-Label` under
+`"exporter"` over `Hash(context_value)`, for the requested length. -/
+theorem exporter_spec {H : Spec.Hkdf} (hi : Implements H)
+    (secret label emptyHash contextHash : ByteArray) (length : Nat) :
+    exporter secret label emptyHash contextHash length =
+      Spec.exporter H secret label emptyHash contextHash length := by
+  unfold exporter Spec.exporter Spec.expandLabelBytes
+  rw [← hi.hashLen_eq, ← hkdfLabel_encode, ← hi.expand_eq, hi.hashLen_eq,
+    show "exporter" = Spec.Label.text .exporter from rfl, expandLabel_spec hi]
+
 end KeySchedule
 end TLS13

@@ -67,5 +67,27 @@ def handshakeSecret (early ecdheSecret emptyHash : ByteArray) : ByteArray :=
 def masterSecret (handshake emptyHash : ByteArray) : ByteArray :=
   Hkdf.extractSha256 (deriveSecret handshake "derived" emptyHash) zeros
 
+/-- Why an exporter request cannot be served, or `none` when it can. The
+application's label becomes the `Label` of an `HkdfLabel`, whose
+`"tls13 " + Label` is an `opaque<7..255>`, so it may be at most 249 bytes; and
+HKDF-Expand yields at most `255 * Hash.length` bytes. -/
+def exporterRequestError? (label : ByteArray) (length : Nat) : Option String :=
+  if label.size > 249 then
+    some s!"exporter label is {label.size} bytes; at most 249 are allowed"
+  else if length > 255 * hashLen then
+    some s!"exporter length {length} exceeds HKDF's {255 * hashLen}-byte limit"
+  else
+    none
+
+/-- RFC 9846 §7.5 `TLS-Exporter(label, context_value, key_length)` from an
+exporter master secret. The caller passes `Hash("")` and `Hash(context_value)`;
+`label` is the application's exporter label as bytes, used as the label of the
+first, `Derive-Secret` step. -/
+def exporter (secret label emptyHash contextHash : ByteArray) (length : Nat) :
+    ByteArray :=
+  let derived := Hkdf.expandSha256 secret (hkdfLabel hashLen label emptyHash)
+    (UInt32.ofNat hashLen)
+  expandLabel derived "exporter" contextHash length
+
 end KeySchedule
 end TLS13

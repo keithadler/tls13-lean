@@ -111,6 +111,7 @@ inductive Error where
   | peerClosedDuringHandshake
   | notConnected (phase : Phase)
   | connectionClosed
+  | invalidExporterRequest (message : String)
   | internalState (message : String)
   deriving Repr, Inhabited
 
@@ -152,6 +153,7 @@ def render : Error → String
   | .peerClosedDuringHandshake => "TLS peer sent close_notify during the handshake"
   | .notConnected phase => s!"TLS connection not ready for application data (waiting for {phase.render})"
   | .connectionClosed => "TLS connection is closed"
+  | .invalidExporterRequest message => s!"TLS exporter: {message}"
   | .internalState message => s!"invalid internal TLS server state: {message}"
 
 /-- Fatal alert to seal (when write keys exist) before discarding the connection. -/
@@ -220,6 +222,9 @@ structure State where
   writeKeys? : Option Record.TrafficKeys := none
   clientApplicationKeys? : Option Record.TrafficKeys := none
   expectedClientFinished? : Option ByteArray := none
+  /-- RFC 9846 §7.1 `exporter_master_secret`, derived with the server flight and
+  served by `exportKeyingMaterial` once the client Finished verifies. -/
+  exporterMasterSecret? : Option ByteArray := none
   /-- Number of reciprocal KeyUpdate messages emitted in the application
   sending epoch chain. RFC 9846 §4.7.3 caps this at `2^48 - 1`. -/
   sendingKeyUpdates : Nat := 0
@@ -654,6 +659,8 @@ def completeClientHello (state : State) (hello : Handshake.ClientHello)
     TLS13.KeySchedule.deriveSecret masterSecret "s ap traffic" finishedHash
   let clientApplicationSecret :=
     TLS13.KeySchedule.deriveSecret masterSecret "c ap traffic" finishedHash
+  let exporterMasterSecret :=
+    TLS13.KeySchedule.deriveSecret masterSecret "exp master" finishedHash
   let serverApplicationKeys ← liftRecord (Record.deriveTrafficKeys serverApplicationSecret)
   let clientApplicationKeys ← liftRecord (Record.deriveTrafficKeys clientApplicationSecret)
 
@@ -688,6 +695,7 @@ def completeClientHello (state : State) (hello : Handshake.ClientHello)
     sendingKeyUpdates := 0
     clientApplicationKeys? := some clientApplicationKeys
     expectedClientFinished? := some expectedClientFinished
+    exporterMasterSecret? := some exporterMasterSecret
     clientHandshakeSecret? := if state.clientAuth.isSome then some clientHandshakeSecret else none
     alpnSelected := alpnSelected
     peerServerName := hello.serverName
@@ -895,6 +903,22 @@ private def processAlert (state : State) (fragment : ByteArray) (duringHandshake
     pure (state, ByteArray.empty)
   else
     throw (.peerAlert level description)
+
+/-- RFC 9846 §7.5 keying material exporter, with RFC 5705's interface:
+`TLS-Exporter(label, context, length)` from this connection's
+`exporter_master_secret`. TLS 1.3 makes an empty context the same as no context.
+Available once the client Finished verifies; it reads the state and changes
+nothing. -/
+def exportKeyingMaterial (state : State) (label context : ByteArray) (length : Nat) :
+    Except Error ByteArray := do
+  unless state.phase == .connected do
+    throw (.notConnected state.phase)
+  if let some message := TLS13.KeySchedule.exporterRequestError? label length then
+    throw (.invalidExporterRequest message)
+  let some secret := state.exporterMasterSecret?
+    | throw (.internalState "missing exporter master secret")
+  pure (TLS13.KeySchedule.exporter secret label emptyTranscriptHash
+    (HaclStar.sha256 context) length)
 
 private def sendKeyUpdateResponse (state : State) : Except Error (State × ByteArray) := do
   if state.sendingKeyUpdates < maxSendingKeyUpdates then

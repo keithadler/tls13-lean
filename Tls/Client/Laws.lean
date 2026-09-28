@@ -2195,6 +2195,79 @@ theorem completeServerHandshake_keySchedule {H : Spec.Hkdf} (hi : Implements H)
     cases h
     exact hgoal _ rfl rfl
 
+/-- **Becoming `connected` installs RFC 9846 §7.1's `exporter_master_secret`**:
+`Derive-Secret(Master Secret, "exp master", ClientHello…server Finished)`. The
+hypotheses are those of `completeServerHandshake_keySchedule`. -/
+theorem completeServerHandshake_exporterMaster {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {message : Handshake.Message} {wire : ByteArray}
+    (inp : Spec.Inputs)
+    (hempty : inp.hash .empty = HaclStar.sha256 ByteArray.empty)
+    (hfin : inp.hash .serverFinished =
+      HaclStar.sha256 (state.transcript ++ message.encoded))
+    (hhs : state.handshakeSecret? = some (Spec.secret H inp .handshake))
+    (h : completeServerHandshake state message = .ok (next, wire)) :
+    next.exporterMasterSecret? = some (Spec.derived H inp .expMaster) := by
+  unfold completeServerHandshake at h
+  simp only [pure_bind] at h
+  obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverSecret, _, h⟩ := except_bind_ok_inv h
+  split at h
+  case isFalse => cases h
+  obtain ⟨handshake, hhsec, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientHandshakeSecret, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨authentication, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientFinished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨handshakeWriteKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨advancedKeys, finishedWire⟩ := sealed
+  have hhandshake : handshake = Spec.secret H inp .handshake := by
+    rw [requireHandshakeSecret_ok hhsec] at hhs
+    exact Option.some.inj hhs
+  have he := deriveSecret_node_spec hi inp .expMaster
+    (masterSecret_node_spec hi inp hhandshake hempty) hfin
+  split at h
+  · cases h; exact congrArg some he
+  · obtain ⟨compatibilityWire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    exact congrArg some he
+
+/-- **The exporter is RFC 9846 §7.5's `TLS-Exporter`** over the connection's
+stored exporter master secret, with `Hash("")` for the `Derive-Secret` step and
+`Hash(context)` for the `"exporter"` expansion. Together with
+`completeServerHandshake_exporterMaster` and `feed_keySchedule`, the secret it
+reads is §7.1's `exporter_master_secret`. -/
+theorem exportKeyingMaterial_spec {H : Spec.Hkdf} (hi : Implements H)
+    {state : State} {label context out : ByteArray} {length : Nat}
+    (h : exportKeyingMaterial state label context length = .ok out) :
+    ∃ secret, state.exporterMasterSecret? = some secret ∧
+      out = Spec.exporter H secret label (HaclStar.sha256 ByteArray.empty)
+        (HaclStar.sha256 context) length := by
+  unfold exportKeyingMaterial at h
+  simp only [pure_bind] at h
+  obtain ⟨_, h⟩ := unless_ok h
+  cases hr : exporterRequestError? label length with
+  | some m => rw [hr] at h; cases h
+  | none =>
+    rw [hr] at h
+    cases hs : state.exporterMasterSecret? with
+    | none => rw [hs] at h; cases h
+    | some secret =>
+      rw [hs] at h
+      cases h
+      exact ⟨secret, rfl, exporter_spec hi _ _ _ _ _⟩
+
+/-- The exporter changes nothing: it is a read of the connection state. -/
+theorem exportKeyingMaterial_connected {state : State} {label context out : ByteArray}
+    {length : Nat} (h : exportKeyingMaterial state label context length = .ok out) :
+    state.phase = .connected := by
+  unfold exportKeyingMaterial at h
+  simp only [pure_bind] at h
+  obtain ⟨hc, _⟩ := unless_ok h
+  exact phase_eq_of_beq hc
+
 private theorem sendKeyUpdateResponse_handshakeSecret {state next : State}
     {wire : ByteArray} (h : sendKeyUpdateResponse state = .ok (next, wire)) :
     next.handshakeSecret? = state.handshakeSecret? := by
@@ -3044,19 +3117,21 @@ record legitimately breaks. -/
 protected or opened, and possibly some §7.2 KeyUpdates. -/
 def RolledEpochs (H : Spec.Hkdf) (before after : State) : Prop :=
   Record.Rolled H before.readKeys? after.readKeys? ∧
-    Record.Rolled H before.writeKeys? after.writeKeys?
+    Record.Rolled H before.writeKeys? after.writeKeys? ∧
+    after.exporterMasterSecret? = before.exporterMasterSecret?
 
 theorem RolledEpochs.refl {H : Spec.Hkdf} (s : State) : RolledEpochs H s s :=
-  ⟨Record.Rolled.refl _, Record.Rolled.refl _⟩
+  ⟨Record.Rolled.refl _, Record.Rolled.refl _, rfl⟩
 
 theorem RolledEpochs.trans {H : Spec.Hkdf} {a b c : State}
     (h1 : RolledEpochs H a b) (h2 : RolledEpochs H b c) : RolledEpochs H a c :=
-  ⟨h1.1.trans h2.1, h1.2.trans h2.2⟩
+  ⟨h1.1.trans h2.1, h1.2.1.trans h2.2.1, h2.2.2.trans h1.2.2⟩
 
 theorem RolledEpochs.of_eq {H : Spec.Hkdf} {a b : State}
-    (hr : b.readKeys? = a.readKeys?) (hw : b.writeKeys? = a.writeKeys?) :
+    (hr : b.readKeys? = a.readKeys?) (hw : b.writeKeys? = a.writeKeys?)
+    (he : b.exporterMasterSecret? = a.exporterMasterSecret? := by rfl) :
     RolledEpochs H a b :=
-  ⟨Record.Rolled.of_eq hr, Record.Rolled.of_eq hw⟩
+  ⟨Record.Rolled.of_eq hr, Record.Rolled.of_eq hw, he⟩
 
 private theorem emitCloseNotify_rolled {H : Spec.Hkdf} {state next : State}
     {wire : ByteArray} (h : emitCloseNotify state = .ok (next, wire)) :
@@ -3068,7 +3143,7 @@ private theorem emitCloseNotify_rolled {H : Spec.Hkdf} {state next : State}
     obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
     obtain ⟨sealedKeys, wireBytes⟩ := sealed
     cases h
-    refine ⟨Record.Rolled.refl _, ?_⟩
+    refine ⟨Record.Rolled.refl _, ?_, rfl⟩
     show Record.Rolled H state.writeKeys? (some sealedKeys)
     rw [requireWriteKeys_ok hk]
     exact Record.Rolled.of_seal (liftRecord_ok hs)
@@ -3104,7 +3179,7 @@ private theorem sendKeyUpdateResponse_rolled {H : Spec.Hkdf} (hi : Implements H)
     obtain ⟨advancedKeys, wireBytes⟩ := sealed
     obtain ⟨updatedKeys, hu, h⟩ := except_bind_ok_inv h
     cases h
-    refine ⟨Record.Rolled.of_eq hread, ?_⟩
+    refine ⟨Record.Rolled.of_eq hread, ?_, rfl⟩
     show Record.Rolled H state.writeKeys? (some updatedKeys)
     rw [requireWriteKeys_ok hk]
     exact (Record.Rolled.of_seal (liftRecord_ok hs)).trans
@@ -3122,7 +3197,7 @@ private theorem acceptKeyUpdate_rolled {H : Spec.Hkdf} (hi : Implements H)
   obtain ⟨updatedReadKeys, hu, h⟩ := except_bind_ok_inv h
   have hstep : RolledEpochs H state
       { state with readKeys? := some updatedReadKeys } := by
-    refine ⟨?_, Record.Rolled.refl _⟩
+    refine ⟨?_, Record.Rolled.refl _, rfl⟩
     show Record.Rolled H state.readKeys? (some updatedReadKeys)
     rw [requireReadKeys_ok hrk]
     exact Record.Rolled.of_update hi (liftRecord_ok hu)
@@ -3199,7 +3274,7 @@ private theorem processProtectedRecord_rolled {H : Spec.Hkdf} (hi : Implements H
   obtain ⟨nextReadKeys, plaintext⟩ := opened
   have hstep : RolledEpochs H state
       { state with readKeys? := some nextReadKeys } := by
-    refine ⟨?_, Record.Rolled.refl _⟩
+    refine ⟨?_, Record.Rolled.refl _, rfl⟩
     show Record.Rolled H state.readKeys? (some nextReadKeys)
     rw [requireReadKeys_ok hrk]
     exact Record.Rolled.of_open (liftRecord_ok hop)
@@ -3466,7 +3541,8 @@ def EstablishedEpochs (H : Spec.Hkdf) (before after : State) : Prop :=
     (∃ (wk : Record.TrafficKeys) (n : Nat), after.writeKeys? = some wk ∧
       wk.ProtectsWith H (Spec.trafficIter H (Spec.derived H inp .cApTraffic) n)) ∧
     (∃ (rk : Record.TrafficKeys) (n : Nat), after.readKeys? = some rk ∧
-      rk.ProtectsWith H (Spec.trafficIter H (Spec.derived H inp .sApTraffic) n))
+      rk.ProtectsWith H (Spec.trafficIter H (Spec.derived H inp .sApTraffic) n)) ∧
+    after.exporterMasterSecret? = some (Spec.derived H inp .expMaster)
 
 private theorem rolled_epoch {H : Spec.Hkdf}
     {before after : Option Record.TrafficKeys} (hr : Record.Rolled H before after)
@@ -3484,8 +3560,8 @@ private theorem EstablishedEpochs.roll {H : Spec.Hkdf} {a b c : State}
     (hc : c.phase = .connected) : EstablishedEpochs H a c := by
   obtain ⟨-, transcript, ht⟩ := h
   refine ⟨hc, transcript, fun inp h1 h2 h3 => ?_⟩
-  obtain ⟨⟨wk, n, hwk, hpw⟩, ⟨rk, m, hrk, hpr⟩⟩ := ht inp h1 h2 h3
-  exact ⟨rolled_epoch hr.2 hwk hpw, rolled_epoch hr.1 hrk hpr⟩
+  obtain ⟨⟨wk, n, hwk, hpw⟩, ⟨rk, m, hrk, hpr⟩, he⟩ := ht inp h1 h2 h3
+  exact ⟨rolled_epoch hr.2.1 hwk hpw, rolled_epoch hr.1 hrk hpr, hr.2.2.trans he⟩
 
 /-- **The client's whole encrypted server flight, with the phase it lands in.**
 `processHandshakeBuffer_keySchedule` with the extra fact that the second case is
@@ -3538,7 +3614,8 @@ private theorem processHandshakeBuffer_established {H : Spec.Hkdf} (hi : Impleme
         state.transcript ++ message.encoded, fun inp h1 h2 h3 => ?_⟩
       obtain ⟨⟨wk, hwk, hdw⟩, ⟨rk, hrk, hdr⟩⟩ :=
         completeServerHandshake_keySchedule hi inp h1 h2 h3 h
-      exact ⟨⟨wk, 0, hwk, hdw.protectsWith⟩, ⟨rk, 0, hrk, hdr.protectsWith⟩⟩
+      exact ⟨⟨wk, 0, hwk, hdw.protectsWith⟩, ⟨rk, 0, hrk, hdr.protectsWith⟩,
+        completeServerHandshake_exporterMaster hi inp h1 h2 h3 h⟩
     · split at h
       · have hw := processHandshakeBuffer_established hi h
         exact hw

@@ -104,6 +104,7 @@ inductive Error where
   | trailingHandshakeAfterFinished
   | notConnected (phase : Phase)
   | connectionClosed
+  | invalidExporterRequest (message : String)
   | internalState (message : String)
   deriving Repr, Inhabited
 
@@ -150,6 +151,7 @@ def render : Error → String
   | .notConnected phase =>
       s!"TLS connection is not ready for application data (waiting for {phase.render})"
   | .connectionClosed => "TLS connection is closed"
+  | .invalidExporterRequest message => s!"TLS exporter: {message}"
   | .internalState message => s!"invalid internal TLS client state: {message}"
 
 /-- Fatal TLS alert description associated with a locally detected handshake
@@ -208,6 +210,9 @@ structure State where
   handshakeSecret? : Option ByteArray := none
   clientHandshakeTrafficSecret? : Option ByteArray := none
   serverHandshakeTrafficSecret? : Option ByteArray := none
+  /-- RFC 9846 §7.1 `exporter_master_secret`, installed on reaching `connected`
+  and kept for `exportKeyingMaterial`. -/
+  exporterMasterSecret? : Option ByteArray := none
   readKeys? : Option Record.TrafficKeys := none
   writeKeys? : Option Record.TrafficKeys := none
   /-- Number of application write-key generations installed by KeyUpdate.
@@ -563,6 +568,8 @@ def completeServerHandshake (state : State) (message : Handshake.Message) :
     TLS13.KeySchedule.deriveSecret masterSecret "c ap traffic" transcriptHash
   let serverApplicationSecret :=
     TLS13.KeySchedule.deriveSecret masterSecret "s ap traffic" transcriptHash
+  let exporterMasterSecret :=
+    TLS13.KeySchedule.deriveSecret masterSecret "exp master" transcriptHash
   let clientApplicationKeys ← liftRecord (Record.deriveTrafficKeys clientApplicationSecret)
   let serverApplicationKeys ← liftRecord (Record.deriveTrafficKeys serverApplicationSecret)
 
@@ -608,6 +615,7 @@ def completeServerHandshake (state : State) (message : Handshake.Message) :
     clientSignaturePermitted := false
     readKeys? := some serverApplicationKeys
     writeKeys? := some clientApplicationKeys
+    exporterMasterSecret? := some exporterMasterSecret
     sendingKeyUpdates := 0
   }, wireBytes)
 
@@ -625,6 +633,21 @@ def sealFatalAlert (state : State) (description : UInt8) :
     state := { state with writeKeys? := some writeKeys, localClosed := true }
     wireBytes
   }
+
+/-- RFC 9846 §7.5 keying material exporter, with RFC 5705's interface:
+`TLS-Exporter(label, context, length)` from this connection's
+`exporter_master_secret`. TLS 1.3 makes an empty context the same as no context.
+Available once the handshake completes; it reads the state and changes nothing. -/
+def exportKeyingMaterial (state : State) (label context : ByteArray) (length : Nat) :
+    Except Error ByteArray := do
+  unless state.phase == .connected do
+    throw (.notConnected state.phase)
+  if let some message := TLS13.KeySchedule.exporterRequestError? label length then
+    throw (.invalidExporterRequest message)
+  let some secret := state.exporterMasterSecret?
+    | throw (.internalState "missing exporter master secret")
+  pure (TLS13.KeySchedule.exporter secret label emptyTranscriptHash
+    (HaclStar.sha256 context) length)
 
 private def sendKeyUpdateResponse (state : State) : Except Error (State × ByteArray) := do
   if state.sendingKeyUpdates < maxSendingKeyUpdates then

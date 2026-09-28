@@ -149,11 +149,17 @@ laws then prove the implementation computes it. Read the fine print:
   the opaque primitive computes the right bytes; a vector cannot say the tree
   has the right shape. **If a theorem and a known-answer test ever disagree, the
   test wins and the specification is what is wrong.**
+- The exporter: both engines store `exporter_master_secret`
+  (`Tls.Client.completeServerHandshake_exporterMaster`, and the fifth conjunct
+  of `Tls.Server.completeClientHello_keySchedule`), `Tls.Client.feed_keySchedule`
+  carries it out to the `feed` boundary, and `exportKeyingMaterial_spec` (both
+  roles) refines RFC 9846 §7.5's `TLS-Exporter` (`Spec.exporter`,
+  `exporter_rfc9846`). The interop gate checks the exported bytes against
+  OpenSSL and Go.
 - Not covered: the PSK/early-data branches (`ext binder`, `res binder`,
-  `c e traffic`, `e exp master`) and the exporter/resumption outputs
-  (`exp master`, `res master`) are in the specification but this implementation
-  does not compute them, so there is nothing to refine — see
-  [Protocol scope](#protocol-scope).
+  `c e traffic`, `e exp master`) and the resumption output (`res master`) are
+  in the specification but this implementation does not compute them, so there
+  is nothing to refine — see [Protocol scope](#protocol-scope).
 
 What is **not** claimed: no security proof of the handshake or state machines,
 no cryptographic correctness of HKDF, the AEAD, the hashes, or the signature
@@ -369,6 +375,10 @@ Implemented and negotiated:
   state to manage. It also responds per requested record while processing a
   feed; a batch containing several requested KeyUpdates is not collapsed into
   one deferred response.
+- **Keying material exporters** (RFC 9846 §7.5, RFC 5705's interface):
+  `exportKeyingMaterial state label context length` in both roles, once
+  connected. Labels up to 249 bytes and lengths up to `255 * 32` bytes, the
+  `HkdfLabel` and HKDF-Expand limits; an empty context is the no-context case.
 - **Orderly closure**: `close_notify` is a directional half-close. It produces
   no automatic echo, leaves the local write direction usable, and causes
   already-framed later records and later input chunks to be ignored. Once the
@@ -379,7 +389,7 @@ Implemented and negotiated:
 Unsupported: PSK and session resumption
 (NewSessionTicket is silently ignored without semantically parsing its body;
 the server never issues tickets),
-0-RTT, the exporter and resumption secrets, post-handshake client authentication,
+0-RTT, the early exporter and resumption secrets, post-handshake client authentication,
 AES-GCM suites, client-side HelloRetryRequest processing, and post-quantum
 hybrid groups (a hybrid key share in a
 ClientHello is tolerated and skipped, not negotiated). The server's
@@ -533,8 +543,8 @@ test binary is built, so a violation is a red target, not a stale README:
 | Target | What it certifies |
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
-| `//TLS13:tls13_assurance` | 23 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Main (compatibility theorem identifier `masterSecret_spec`)/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies`, and `Chain.validate_leaf_keyUsage` |
-| `//Tls:tls_assurance` | 88 principal theorems — finite write traces (`WriteRun.nodup`, `AeadWriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, the schedule-refined `run_nonce_trace_spec`/`start_run_nonce_trace_spec`, `run_epochs`, and nonce/sequence injectivity), record conservation, the exact `TLSInnerPlaintext` bound, and seal/open inversion; ClientHello canonicity and body injectivity; the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary); and the state-machine transition and invariant laws, including KeyUpdate limit/error behavior, no output after local closure, directional peer closure, both directions of the connected-only application-data rule, and both engines' no-epoch-before-the-first-flight clauses |
+| `//TLS13:tls13_assurance` | 25 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Main (compatibility theorem identifier `masterSecret_spec`)/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies`, and `Chain.validate_leaf_keyUsage` |
+| `//Tls:tls_assurance` | 92 principal theorems — finite write traces (`WriteRun.nodup`, `AeadWriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, the schedule-refined `run_nonce_trace_spec`/`start_run_nonce_trace_spec`, `run_epochs`, and nonce/sequence injectivity), record conservation, the exact `TLSInnerPlaintext` bound, and seal/open inversion; ClientHello canonicity and body injectivity; the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary); and the state-machine transition and invariant laws, including KeyUpdate limit/error behavior, no output after local closure, directional peer closure, both directions of the connected-only application-data rule, and both engines' no-epoch-before-the-first-flight clauses |
 
 Each target also scans every constant of the full 28-module first-party closure
 (`HaclStar`, `TLS13`, `Tls`): nothing may reach
@@ -564,7 +574,7 @@ client and server. Interop against *independent* clients is a separate,
 scripted gate — `bazel test //Test:external_interop_test
 --test_output=streamed` — which starts the one-shot loopback harness
 (`bazel run //Test:tls_external_server -- 8443` runs it manually) and
-drives six externally implemented handshakes, asserting completion and the
+drives seven externally implemented handshakes, asserting completion and the
 HTTP/1.1 200 body:
 
 - OpenSSL `s_client` with default groups (tolerating its X25519MLKEM768
@@ -576,7 +586,10 @@ HTTP/1.1 200 body:
   TCP boundaries);
 - Go `crypto/tls` with its default configuration, and a forced
   HelloRetryRequest run (CurvePreferences restricted to
-  {X25519MLKEM768, P-256}, so the server must retry to P-256).
+  {X25519MLKEM768, P-256}, so the server must retry to P-256);
+- RFC 9846 §7.5 exported keying material: OpenSSL (`-keymatexport`) and Go
+  (`ExportKeyingMaterial`) must each export exactly the bytes the server
+  exports for the same label.
 
 The gate is tagged `manual`/`local` — it binds loopback ports and shells
 out to host `openssl` and `curl` (the Go cases skip gracefully without a
@@ -600,8 +613,19 @@ cd tls13-lean
 bazel test //...
 ```
 
-`lakefile.lean` is an IDE/LSP project model only; Bazel is the authoritative
-build because it compiles and links the HACL\* C shim. The checked-in
+`lakefile.lean` is an IDE/LSP project model; Bazel is the authoritative
+build because it compiles and links the HACL\* C shim. On a machine without
+Bazel and Nix, Lake can build and run the tests too: unpack the archive
+`MODULE.bazel` pins and pass its `dist` directory,
+
+```sh
+lake build -K hacl=/path/to/hacl-star-504c2987…/dist hacl_kat_test
+.lake/build/bin/hacl_kat_test
+```
+
+which compiles the same fifteen HACL\* units and two shims into the test
+executables and `tls_external_server`. Without `-K hacl`, none of that is
+declared. The checked-in
 `lean-toolchain` selects `nightly-2026-04-25`, whose upstream commit
 (`24bef91f9a20a45f074729e869461d374687de1c`) matches the Nix Lean toolchain
 registered by Bazel. Install that Elan toolchain before opening the project in
@@ -624,7 +648,7 @@ transitions, and key-schedule refinement through
 The proof boundary excludes a server `feed`-level key-schedule statement and a
 single client whole-handshake law joining
 `acceptServerHello_keySchedule` with `feed_keySchedule`. The §7.1 branches
-without executable support (PSK binders, early data, exporter and resumption
-secrets) have a specification but no refinement. No security argument is
+without executable support (PSK binders, early data, the early exporter and
+the resumption secret) have a specification but no refinement. No security argument is
 claimed for confidentiality, authentication, or the handshake as a
 cryptographic protocol.

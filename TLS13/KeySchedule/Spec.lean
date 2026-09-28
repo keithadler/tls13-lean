@@ -98,6 +98,8 @@ inductive Label where
   | finished
   /-- §7.2, the successor of an application traffic secret. -/
   | trafficUpd
+  /-- §7.5, the second expansion of `TLS-Exporter`. -/
+  | exporter
   deriving Repr, BEq, DecidableEq, Inhabited
 
 /-- The exact label strings of RFC 8446. -/
@@ -117,6 +119,7 @@ inductive Label where
   | .iv => "iv"
   | .finished => "finished"
   | .trafficUpd => "traffic upd"
+  | .exporter => "exporter"
 
 /-- **The labels are RFC 8446's, spelled out.** A typo anywhere in `Label.text`
 fails this theorem, and every derivation below names a `Label` rather than a
@@ -136,8 +139,9 @@ theorem Label.text_rfc8446 :
     Label.text .key = "key" ∧
     Label.text .iv = "iv" ∧
     Label.text .finished = "finished" ∧
-    Label.text .trafficUpd = "traffic upd" :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    Label.text .trafficUpd = "traffic upd" ∧
+    Label.text .exporter = "exporter" :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## The `HkdfLabel` wire structure
 
@@ -405,6 +409,55 @@ theorem emptyContext_rfc8446 (H : Hkdf) (s : ByteArray) (keyLength ivLength : Na
     finishedKey H s = expandLabel H s .finished ByteArray.empty H.hashLen ∧
     nextTrafficSecret H s = expandLabel H s .trafficUpd ByteArray.empty H.hashLen :=
   ⟨rfl, rfl, rfl, rfl⟩
+
+/-! ## Keying material exporters
+
+RFC 9846 §7.5 derives exported keying material in two steps. The first is a
+`Derive-Secret` whose label is the *application's* exporter label, an arbitrary
+byte string rather than one of RFC 9846's own `Label`s, over the empty message
+sequence. The second expands that under the fixed label `"exporter"` with the
+hash of the application's context value:
+
+```
+TLS-Exporter(label, context_value, key_length) =
+    HKDF-Expand-Label(Derive-Secret(Secret, label, ""),
+                      "exporter", Hash(context_value), key_length)
+```
+
+`Secret` is `exporter_master_secret` or `early_exporter_master_secret`. The two
+hashes are passed in, as everywhere in this module. -/
+
+/-- `HKDF-Expand-Label` with a label given as bytes: the first step of §7.5,
+whose label comes from the application. `expandLabel` is this at `label.text`
+(`expandLabel_eq_bytes`). -/
+@[expose] def expandLabelBytes (H : Hkdf) (secret label context : ByteArray)
+    (length : Nat) : ByteArray :=
+  H.expand secret (HkdfLabel.encode ⟨length, label, context⟩) length
+
+theorem expandLabel_eq_bytes (H : Hkdf) (secret : ByteArray) (label : Label)
+    (context : ByteArray) (length : Nat) :
+    expandLabel H secret label context length =
+      expandLabelBytes H secret label.text.toUTF8 context length := rfl
+
+/-- §7.5's `TLS-Exporter`. `emptyHash` is `Hash("")`, the transcript hash of the
+empty message sequence that `Derive-Secret(Secret, label, "")` binds;
+`contextHash` is `Hash(context_value)`. -/
+@[expose] def exporter (H : Hkdf) (secret label emptyHash contextHash : ByteArray)
+    (length : Nat) : ByteArray :=
+  expandLabel H (expandLabelBytes H secret label emptyHash H.hashLen) .exporter
+    contextHash length
+
+/-- **`TLS-Exporter` is RFC 9846 §7.5's two expansions.** The first binds the
+empty transcript's hash and yields a `Hash.length` secret; the second is keyed
+with that secret, labelled `"exporter"`, bound to the context's hash, and asks
+for the caller's length. Swapping the two hashes, or the two labels, fails this
+equation. -/
+theorem exporter_rfc9846 (H : Hkdf) (secret label emptyHash contextHash : ByteArray)
+    (length : Nat) :
+    exporter H secret label emptyHash contextHash length =
+      H.expand
+        (H.expand secret (HkdfLabel.encode ⟨H.hashLen, label, emptyHash⟩) H.hashLen)
+        (HkdfLabel.encode ⟨length, "exporter".toUTF8, contextHash⟩) length := rfl
 
 /-! ## Describing traffic epochs
 

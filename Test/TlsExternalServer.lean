@@ -1,6 +1,7 @@
 import Std.Async.TCP
 import Std.Time
 import Tls.Server
+import HaclStar.Hex
 
 /-!
 A deliberately small, one-shot socket shell around the sans-I/O TLS server.
@@ -148,6 +149,12 @@ def main (args : List String) : IO Unit := do
     let connected ← completeHandshake client readSize (Server.start config)
     logLine s!"NEGOTIATED suite={connected.cipherSuiteSelected} group={repr connected.groupSelected}"
     logLine s!"CLIENT_CERTIFICATES {connected.peerCertificates.size}"
+    -- RFC 9846 §7.5 exported keying material, compared by the interop gate with
+    -- what the client exports for the same label and an empty context.
+    match Server.exportKeyingMaterial connected "EXPERIMENTAL-tls13-lean".toUTF8
+        ByteArray.empty 32 with
+    | .ok material => logLine s!"EXPORTER {HaclStar.Hex.encode material}"
+    | .error error => logLine s!"EXPORTER-ERROR {error}"
     if connected.peerClosed then
       logLine "peer closed immediately after the handshake"
     else

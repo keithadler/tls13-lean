@@ -165,6 +165,56 @@ private def hex (encoded : String) : ByteArray :=
   | some bytes => bytes
   | none => panic! "invalid embedded test hex"
 
+/-- RFC 9846 §7.5 exporter checks on a connected client/server pair, with each
+side's state from before its handshake completed. -/
+private def checkExporters (clientBefore client : Client.State)
+    (serverBefore server : Server.State) : IO Unit := do
+  -- RFC 9846 §7.5: both ends export the same keying material, and the label,
+  -- the context and the length each change it (the length is bound into the
+  -- HkdfLabel, so a longer export is not an extension of a shorter one).
+  -- Neither end exports before its handshake completes, and requests beyond
+  -- the HkdfLabel and HKDF-Expand limits are refused. The external interop
+  -- gate checks the same exports against OpenSSL and Go.
+  let exporterLabel := "EXPERIMENTAL-tls13-lean".toUTF8
+  let clientExport ← clientResult
+    (Client.exportKeyingMaterial client exporterLabel ByteArray.empty 32)
+  let serverExport ← serverResult
+    (Server.exportKeyingMaterial server exporterLabel ByteArray.empty 32)
+  expectEq "client and server export the same keying material" clientExport serverExport
+  expectEq "exported keying material length" clientExport.size 32
+  let clientContextExport ← clientResult
+    (Client.exportKeyingMaterial client exporterLabel "context".toUTF8 32)
+  let serverContextExport ← serverResult
+    (Server.exportKeyingMaterial server exporterLabel "context".toUTF8 32)
+  expectEq "exports with a context agree" clientContextExport serverContextExport
+  expect "the context changes the export" (clientContextExport != clientExport)
+  let otherLabelExport ← clientResult
+    (Client.exportKeyingMaterial client "EXPERIMENTAL-other".toUTF8
+      ByteArray.empty 32)
+  expect "the label changes the export" (otherLabelExport != clientExport)
+  let longerExport ← clientResult
+    (Client.exportKeyingMaterial client exporterLabel ByteArray.empty 64)
+  expectEq "a 64-byte export" longerExport.size 64
+  expect "the length is bound into the export"
+    (longerExport.extract 0 32 != clientExport)
+  let maximalExport ← clientResult
+    (Client.exportKeyingMaterial client (fill 249 0x61) ByteArray.empty
+      (255 * 32))
+  expectEq "the largest export HKDF allows" maximalExport.size (255 * 32)
+  match Client.exportKeyingMaterial client (fill 250 0x61) ByteArray.empty 32 with
+  | .error (.invalidExporterRequest _) => pure ()
+  | _ => throw (IO.userError "client exported under a 250-byte label")
+  match Server.exportKeyingMaterial server exporterLabel ByteArray.empty
+      (255 * 32 + 1) with
+  | .error (.invalidExporterRequest _) => pure ()
+  | _ => throw (IO.userError "server exported beyond HKDF-Expand's limit")
+  match Client.exportKeyingMaterial clientBefore exporterLabel ByteArray.empty 32 with
+  | .error (.notConnected _) => pure ()
+  | _ => throw (IO.userError "client exported before its handshake completed")
+  match Server.exportKeyingMaterial serverBefore exporterLabel ByteArray.empty 32 with
+  | .error (.notConnected _) => pure ()
+  | _ => throw (IO.userError "server exported before the client Finished")
+
 def main : IO Unit := do
   let pem ← IO.FS.readFile "Test/Fixtures/Tls/server_cert.pem"
   let certificates ← x509Result (TLS13.X509.PEM.decodeCertificates pem)
@@ -330,6 +380,9 @@ def main : IO Unit := do
   let serverDone ← serverResult
     (Server.feed serverFlight.state clientFinished.wireBytes)
   expect "server connected after client Finished" serverDone.state.connected
+
+  checkExporters clientHello.state clientFinished.state serverFlight.state
+    serverDone.state
 
   let request := "mainstream interop request".toUTF8
   let sealedRequest ← clientResult

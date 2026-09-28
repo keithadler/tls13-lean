@@ -66,6 +66,13 @@ func main() {
 	fmt.Printf("GO-NEGOTIATED version=%x suite=%s alpn=%q\n",
 		state.Version, tls.CipherSuiteName(state.CipherSuite), state.NegotiatedProtocol)
 
+	// RFC 9846 §7.5: the gate compares this with the server's own export.
+	material, err := state.ExportKeyingMaterial("EXPERIMENTAL-tls13-lean", nil, 32)
+	if err != nil {
+		fatal("export keying material: %v", err)
+	}
+	fmt.Printf("GO-EXPORTER %X\n", material)
+
 	request := "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
 	if _, err := io.WriteString(conn, request); err != nil {
 		fatal("write request: %v", err)
