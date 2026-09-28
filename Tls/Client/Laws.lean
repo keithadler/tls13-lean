@@ -411,7 +411,8 @@ private theorem processHandshakeBuffer_write {state next : State} {wire : ByteAr
       have hw := completeServerHandshake_write h
       exact hw
     · split at h
-      · have hw := processHandshakeBuffer_write h
+      · rw [acceptTicket_eq'] at h
+        have hw := processHandshakeBuffer_write h
         exact hw
       · split at h
         · obtain ⟨_, h⟩ := unless_ok h
@@ -435,6 +436,19 @@ private theorem processHandshakeBuffer_write {state next : State} {wire : ByteAr
       | exact hsize
       | exact hbuf
 
+
+/-- After EncryptedExtensions the client waits for a Certificate, or, when
+resuming, for the server Finished: in neither case connected or still waiting
+for the ServerHello. -/
+private theorem eePhase_ne_connected (r : Bool) :
+    (if r = true then Phase.waitingServerFinished else Phase.waitingCertificate) ≠
+      Phase.connected := by
+  cases r <;> decide
+
+private theorem eePhase_ne_serverHello (r : Bool) :
+    (if r = true then Phase.waitingServerFinished else Phase.waitingCertificate) ≠
+      Phase.waitingServerHello := by
+  cases r <;> decide
 
 private theorem phase_eq_of_beq {p q : Phase} (h : (p == q) = true) : p = q := by
   cases p <;> cases q <;> first | rfl | exact absurd h (by decide)
@@ -505,7 +519,7 @@ theorem acceptHelloRetryRequest_transcript {state next : State}
   obtain ⟨messageHash, hmh, h⟩ := except_bind_ok_inv h
   obtain ⟨wireBytes, hw, h⟩ := except_bind_ok_inv h
   cases h
-  exact ⟨messageHash, secondHello, liftHandshake_ok hmh, liftRecord_ok hw, rfl⟩
+  exact ⟨messageHash, _, liftHandshake_ok hmh, liftRecord_ok hw, rfl⟩
 
 /-- **A HelloRetryRequest is answered at most once, and only a legal one**
 (RFC 9846 §4.1.4): it selects a cipher suite the ClientHello offered and a
@@ -539,7 +553,7 @@ theorem acceptHelloRetryRequest_offers {state next : State}
   exact ⟨retry, liftHandshake_ok hp, h1, rfl, h2, h3, h4, rfl, rfl⟩
 
 private theorem checkServerHello_ok {state : State} {hello : Handshake.ServerHello}
-    (h : checkServerHello state hello = .ok ()) :
+    {psk : Option ByteArray} (h : checkServerHello state hello = .ok psk) :
     state.offeredCipherSuites.contains hello.cipherSuite = true ∧
       state.offeredKeyShareGroups.contains hello.selectedGroup = true := by
   unfold checkServerHello at h
@@ -547,6 +561,25 @@ private theorem checkServerHello_ok {state : State} {hello : Handshake.ServerHel
   obtain ⟨h2, h⟩ := unless_ok h
   obtain ⟨h3, _⟩ := unless_ok h
   exact ⟨h2, h3⟩
+
+/-- A PSK the client accepts from a ServerHello is the one its ClientHello
+offered. -/
+private theorem checkServerHello_psk {state : State} {hello : Handshake.ServerHello}
+    {psk : Option ByteArray} (h : checkServerHello state hello = .ok psk) :
+    psk = none ∨ psk = state.offeredPsk? := by
+  unfold checkServerHello at h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨selected, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · cases h; exact Or.inl rfl
+  · split at h
+    · rename_i p hp
+      split at h
+      · cases h; exact Or.inr hp.symm
+      · cases h
+    · cases h
 
 /-- **A ServerHello is accepted only for a suite and group on offer.** After a
 HelloRetryRequest those are exactly the retry's (`acceptHelloRetryRequest_offers`),
@@ -1206,12 +1239,15 @@ private theorem processHandshakeBuffer_wellFormed {state next : State}
       obtain ⟨alpn, _, h⟩ := except_bind_ok_inv h
       split at h
       · obtain ⟨_, h⟩ := unless_ok h
-        exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
-      · exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+        exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by first | cases hc | exact absurd hc (eePhase_ne_connected _)),
+            fun hp => (by first | cases hp | exact absurd hp (eePhase_ne_serverHello _))⟩
+      · exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by first | cases hc | exact absurd hc (eePhase_ne_connected _)),
+            fun hp => (by first | cases hp | exact absurd hp (eePhase_ne_serverHello _))⟩
     · split at h
       · obtain ⟨_, h⟩ := if_throw_ok h
         obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-        exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
+        exact processHandshakeBuffer_wellFormed h ⟨fun hc => (by first | cases hc | exact absurd hc (eePhase_ne_connected _)),
+            fun hp => (by first | cases hp | exact absurd hp (eePhase_ne_serverHello _))⟩
       · obtain ⟨_, h⟩ := unless_ok h
         obtain ⟨_, _, h⟩ := except_bind_ok_inv h
         obtain ⟨_, _, h⟩ := except_bind_ok_inv h
@@ -1228,7 +1264,8 @@ private theorem processHandshakeBuffer_wellFormed {state next : State}
       obtain ⟨_, h⟩ := unless_ok h
       exact completeServerHandshake_wellFormed h
     · split at h
-      · exact processHandshakeBuffer_wellFormed h hinv
+      · rw [acceptTicket_eq'] at h
+        exact processHandshakeBuffer_wellFormed h hinv
       · split at h
         · obtain ⟨_, h⟩ := unless_ok h
           split at h
@@ -1544,7 +1581,8 @@ private theorem processHandshakeBuffer_connected {state next : State}
       have hph' : state.phase = Phase.waitingServerFinished := hph
       rw [hc] at hph'; cases hph'
     · split at h
-      · have h2 := processHandshakeBuffer_connected h hc
+      · rw [acceptTicket_eq'] at h
+        have h2 := processHandshakeBuffer_connected h hc
         exact h2
       · split at h
         · obtain ⟨_, h⟩ := unless_ok h
@@ -2215,17 +2253,17 @@ private theorem requireHandshakeSecret_ok {state : State} {secret : ByteArray}
 /-- The handshake-traffic branch of the diagram, for the values the engine
 holds at `acceptServerHello`. -/
 private theorem hsEpoch_spec {H : Spec.Hkdf} (hi : Implements H) (inp : Spec.Inputs)
-    (shared transcriptHash : ByteArray)
-    (hpsk : inp.psk = zeros) (hecdhe : inp.ecdhe = shared)
+    (psk shared transcriptHash : ByteArray)
+    (hpsk : inp.psk = psk) (hecdhe : inp.ecdhe = shared)
     (hempty : inp.hash .empty = HaclStar.sha256 ByteArray.empty)
     (hsh : inp.hash .serverHello = transcriptHash) :
-    handshakeSecret earlySecret shared (HaclStar.sha256 ByteArray.empty)
+    handshakeSecret (earlySecret psk) shared (HaclStar.sha256 ByteArray.empty)
         = Spec.secret H inp .handshake ∧
-    deriveSecret (handshakeSecret earlySecret shared (HaclStar.sha256 ByteArray.empty))
+    deriveSecret (handshakeSecret (earlySecret psk) shared (HaclStar.sha256 ByteArray.empty))
         "c hs traffic" transcriptHash = Spec.derived H inp .cHsTraffic ∧
-    deriveSecret (handshakeSecret earlySecret shared (HaclStar.sha256 ByteArray.empty))
+    deriveSecret (handshakeSecret (earlySecret psk) shared (HaclStar.sha256 ByteArray.empty))
         "s hs traffic" transcriptHash = Spec.derived H inp .sHsTraffic :=
-  have hhs := handshakeSecret_node_spec hi inp hpsk hecdhe hempty
+  have hhs := handshakeSecret_psk_node_spec hi inp hpsk hecdhe hempty
   ⟨hhs, deriveSecret_node_spec hi inp .cHsTraffic hhs hsh,
     deriveSecret_node_spec hi inp .sHsTraffic hhs hsh⟩
 
@@ -2273,9 +2311,10 @@ Secret binds the **empty** message sequence, while `"c hs traffic"` and
 theorem acceptServerHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
     {state next : State} {message : Handshake.Message}
     (h : acceptServerHello state message = .ok next) :
-    ∃ ecdhe : ByteArray, ecdhe.size = hashLen ∧
+    ∃ ecdhe psk : ByteArray, ecdhe.size = hashLen ∧
+      (psk = zeros ∨ state.offeredPsk? = some psk) ∧
       ∀ inp : Spec.Inputs,
-        inp.psk = zeros →
+        inp.psk = psk →
         inp.ecdhe = ecdhe →
         inp.hash .empty = HaclStar.sha256 ByteArray.empty →
         inp.hash .serverHello = HaclStar.sha256 (state.transcript ++ message.encoded) →
@@ -2290,7 +2329,14 @@ theorem acceptServerHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
   simp only [pure_bind] at h
   obtain ⟨_, h⟩ := unless_ok h
   obtain ⟨hello, _, h⟩ := except_bind_ok_inv h
-  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨pskOpt, hcs, h⟩ := except_bind_ok_inv h
+  have hpskFact : pskOpt.getD zeros = zeros ∨
+      state.offeredPsk? = some (pskOpt.getD zeros) := by
+    rcases checkServerHello_psk hcs with hn | hs
+    · exact Or.inl (by rw [hn]; rfl)
+    · cases pskOpt with
+      | none => exact Or.inl rfl
+      | some p => exact Or.inr hs.symm
   split at h
   · split at h
     · rename_i shared _
@@ -2299,8 +2345,9 @@ theorem acceptServerHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
         obtain ⟨writeKeys, hw, h⟩ := except_bind_ok_inv h
         obtain ⟨readKeys, hr, h⟩ := except_bind_ok_inv h
         cases h
-        refine ⟨shared, eq_of_beq hsize, fun inp hpsk hecdhe hempty hsh => ?_⟩
-        obtain ⟨h1, h2, h3⟩ := hsEpoch_spec hi inp shared _ hpsk hecdhe hempty hsh
+        refine ⟨shared, pskOpt.getD zeros, eq_of_beq hsize, hpskFact,
+          fun inp hpsk hecdhe hempty hsh => ?_⟩
+        obtain ⟨h1, h2, h3⟩ := hsEpoch_spec hi inp _ shared _ hpsk hecdhe hempty hsh
         refine ⟨congrArg some h1, congrArg some h2, congrArg some h3,
           ⟨writeKeys, rfl, ?_⟩, ⟨readKeys, rfl, ?_⟩⟩
         · rw [← h2]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hw)
@@ -2315,8 +2362,9 @@ theorem acceptServerHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
           obtain ⟨writeKeys, hw, h⟩ := except_bind_ok_inv h
           obtain ⟨readKeys, hr, h⟩ := except_bind_ok_inv h
           cases h
-          refine ⟨shared, eq_of_beq hsize, fun inp hpsk hecdhe hempty hsh => ?_⟩
-          obtain ⟨h1, h2, h3⟩ := hsEpoch_spec hi inp shared _ hpsk hecdhe hempty hsh
+          refine ⟨shared, pskOpt.getD zeros, eq_of_beq hsize, hpskFact,
+          fun inp hpsk hecdhe hempty hsh => ?_⟩
+          obtain ⟨h1, h2, h3⟩ := hsEpoch_spec hi inp _ shared _ hpsk hecdhe hempty hsh
           refine ⟨congrArg some h1, congrArg some h2, congrArg some h3,
             ⟨writeKeys, rfl, ?_⟩, ⟨readKeys, rfl, ?_⟩⟩
           · rw [← h2]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hw)
@@ -2423,6 +2471,49 @@ theorem completeServerHandshake_exporterMaster {H : Spec.Hkdf} (hi : Implements 
     cases h
     exact congrArg some he
 
+/-- **Becoming `connected` installs RFC 9846 §7.1's `resumption_master_secret`**:
+`Derive-Secret(Master Secret, "res master", ClientHello…client Finished)`, where
+the transcript runs through the server Finished and then the client's own
+Certificate/CertificateVerify (if any) and Finished. The hypotheses are those of
+`completeServerHandshake_keySchedule`. -/
+theorem completeServerHandshake_resumptionMaster {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {message : Handshake.Message} {wire : ByteArray}
+    (inp : Spec.Inputs)
+    (hempty : inp.hash .empty = HaclStar.sha256 ByteArray.empty)
+    (hhs : state.handshakeSecret? = some (Spec.secret H inp .handshake))
+    (h : completeServerHandshake state message = .ok (next, wire)) :
+    ∃ authentication clientFinished : ByteArray,
+      inp.hash .clientFinished = HaclStar.sha256
+          (state.transcript ++ message.encoded ++ authentication ++ clientFinished) →
+      next.resumptionMasterSecret? = some (Spec.derived H inp .resMaster) := by
+  unfold completeServerHandshake at h
+  simp only [pure_bind] at h
+  obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverSecret, _, h⟩ := except_bind_ok_inv h
+  split at h
+  case isFalse => cases h
+  obtain ⟨handshake, hhsec, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientHandshakeSecret, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨authentication, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientFinished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨handshakeWriteKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨advancedKeys, finishedWire⟩ := sealed
+  have hhandshake : handshake = Spec.secret H inp .handshake := by
+    rw [requireHandshakeSecret_ok hhsec] at hhs
+    exact Option.some.inj hhs
+  refine ⟨authentication, clientFinished.encoded, fun hcf => ?_⟩
+  have he := deriveSecret_node_spec hi inp .resMaster
+    (masterSecret_node_spec hi inp hhandshake hempty) hcf
+  split at h
+  · cases h; exact congrArg some he
+  · obtain ⟨compatibilityWire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    exact congrArg some he
+
 /-- **The exporter is RFC 9846 §7.5's `TLS-Exporter`** over the connection's
 stored exporter master secret, with `Hash("")` for the `Derive-Secret` step and
 `Hash(context)` for the `"exporter"` expansion. Together with
@@ -2456,6 +2547,49 @@ theorem exportKeyingMaterial_connected {state : State} {label context out : Byte
   simp only [pure_bind] at h
   obtain ⟨hc, _⟩ := unless_ok h
   exact phase_eq_of_beq hc
+
+/-- **The client's PSK binder is RFC 9846 §4.2.11.2's**: the HMAC, keyed by
+§4.4.4's `finished_key` of §7.1's `binder_key` for the PSK (`"res binder"`
+over the empty transcript, off the PSK's Early Secret), of the hash of the
+transcript before this ClientHello and the ClientHello truncated before its
+binders; it replaces the placeholder binder. -/
+theorem bindPsk_spec {H : Spec.Hkdf} (hi : Implements H) (inp : Spec.Inputs)
+    {psk : ByteArray} (hpsk : inp.psk = psk)
+    (hempty : inp.hash .empty = HaclStar.sha256 ByteArray.empty)
+    (beforeHello : ByteArray) (hello : Handshake.Message) :
+    bindPsk (some psk) beforeHello hello =
+      Handshake.withPskBinder hello
+        (HaclStar.hmacSha256 (Spec.finishedKey H (Spec.derived H inp .resBinder))
+          (HaclStar.sha256 (beforeHello ++
+            Handshake.truncatedClientHello hello.encoded Handshake.clientBindersLength))) := by
+  have hkey := binderKey_spec hi inp hempty
+  rw [hpsk] at hkey
+  unfold bindPsk
+  simp only []
+  rw [finishedVerifyData_spec hi]
+  show Handshake.withPskBinder hello (HaclStar.hmacSha256
+      (Spec.finishedKey H (binderKey (earlySecret psk) (HaclStar.sha256 ByteArray.empty))) _) = _
+  rw [hkey]
+
+/-- **A kept ticket's PSK is RFC 9846 §4.6.1's**: when `acceptTicket` keeps a
+ticket, the NewSessionTicket parsed, the connection had a resumption master
+secret, and the PSK is that secret expanded under `"resumption"` with the
+ticket's nonce; the identity is the ticket itself. -/
+theorem acceptTicket_psk {H : Spec.Hkdf} (hi : Implements H) {state : State}
+    {message : Handshake.Message} {ticket : Ticket}
+    (h : (acceptTicket state message).tickets = state.tickets.push ticket) :
+    ∃ resumptionMaster nst, state.resumptionMasterSecret? = some resumptionMaster ∧
+      Handshake.parseNewSessionTicket message = .ok nst ∧
+      ticket.identity = nst.ticket ∧
+      ticket.psk = Spec.ticketPsk H resumptionMaster nst.ticketNonce := by
+  unfold acceptTicket at h
+  split at h
+  · rename_i rms nst hrms hparse
+    simp only [Array.push_inj_right] at h
+    subst h
+    exact ⟨rms, nst, hrms, hparse, rfl, ticketPsk_spec hi _ _⟩
+  · have hsz := congrArg Array.size h
+    simp at hsz
 
 private theorem sendKeyUpdate_handshakeSecret {state next : State}
     {wire : ByteArray} {request : Handshake.KeyUpdateRequest} (h : sendKeyUpdate state request = .ok (next, wire)) :
@@ -2559,7 +2693,8 @@ theorem processHandshakeBuffer_keySchedule {H : Spec.Hkdf} (hi : Implements H)
       exact Or.inr ⟨state.transcript ++ message.encoded, fun inp h1 h2 h3 =>
         completeServerHandshake_keySchedule hi inp h1 h2 h3 h⟩
     · split at h
-      · have hw := processHandshakeBuffer_keySchedule hi h
+      · rw [acceptTicket_eq'] at h
+        have hw := processHandshakeBuffer_keySchedule hi h
         exact hw
       · split at h
         · obtain ⟨_, h⟩ := unless_ok h
@@ -3019,11 +3154,15 @@ private theorem processHandshakeBuffer_epochs {H : Spec.Hkdf} (hi : Implements H
       split at h
       · obtain ⟨_, h⟩ := unless_ok h
         have hw := processHandshakeBuffer_epochs hi h
-          ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
-        exact SpecEffect.of_eq hw rfl hph'.symm
+          ⟨fun hc => (by first | cases hc | exact absurd hc (eePhase_ne_connected _)),
+            fun hp => (by first | cases hp | exact absurd hp (eePhase_ne_serverHello _))⟩
+        exact SpecEffect.of_eq hw rfl
+          ((writeEpochLabel_of_ne_connected (eePhase_ne_connected _)).trans hph'.symm)
       · have hw := processHandshakeBuffer_epochs hi h
-          ⟨fun hc => (by cases hc), fun hp => (by cases hp)⟩
-        exact SpecEffect.of_eq hw rfl hph'.symm
+          ⟨fun hc => (by first | cases hc | exact absurd hc (eePhase_ne_connected _)),
+            fun hp => (by first | cases hp | exact absurd hp (eePhase_ne_serverHello _))⟩
+        exact SpecEffect.of_eq hw rfl
+          ((writeEpochLabel_of_ne_connected (eePhase_ne_connected _)).trans hph'.symm)
     · rename_i hph
       have hph' : writeEpochLabel state.phase = Spec.Label.cHsTraffic := by
         rw [show state.phase = Phase.waitingCertificate from hph]; rfl
@@ -3058,7 +3197,8 @@ private theorem processHandshakeBuffer_epochs {H : Spec.Hkdf} (hi : Implements H
         (wellFormed_transfer hinv rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
       exact SpecEffect.of_eq hw rfl rfl
     · split at h
-      · have hw := processHandshakeBuffer_epochs hi h
+      · rw [acceptTicket_eq'] at h
+        have hw := processHandshakeBuffer_epochs hi h
           (wellFormed_transfer hinv rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
         exact SpecEffect.of_eq hw rfl rfl
       · split at h
@@ -3467,7 +3607,8 @@ private theorem processHandshakeBuffer_rolled {H : Spec.Hkdf} (hi : Implements H
       have hph' : state.phase = Phase.waitingServerFinished := hph
       rw [hc] at hph'; cases hph'
     · split at h
-      · have hw := processHandshakeBuffer_rolled hi h hc
+      · rw [acceptTicket_eq'] at h
+        have hw := processHandshakeBuffer_rolled hi h hc
         exact hw
       · split at h
         · obtain ⟨_, h⟩ := unless_ok h
@@ -3639,12 +3780,15 @@ private theorem processHandshakeBuffer_phase_ne {state next : State}
       obtain ⟨alpn, _, h⟩ := except_bind_ok_inv h
       split at h
       · obtain ⟨_, h⟩ := unless_ok h
-        exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
-      · exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
+        exact processHandshakeBuffer_phase_ne h
+          (by first | (intro hc; cases hc) | exact eePhase_ne_serverHello _)
+      · exact processHandshakeBuffer_phase_ne h
+          (by first | (intro hc; cases hc) | exact eePhase_ne_serverHello _)
     · split at h
       · obtain ⟨_, h⟩ := if_throw_ok h
         obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-        exact processHandshakeBuffer_phase_ne h (by intro hc; cases hc)
+        exact processHandshakeBuffer_phase_ne h
+          (by first | (intro hc; cases hc) | exact eePhase_ne_serverHello _)
       · obtain ⟨_, h⟩ := unless_ok h
         obtain ⟨_, _, h⟩ := except_bind_ok_inv h
         obtain ⟨_, _, h⟩ := except_bind_ok_inv h
@@ -3664,7 +3808,8 @@ private theorem processHandshakeBuffer_phase_ne {state next : State}
     · rename_i hph'
       have hc : state.phase = Phase.connected := hph'
       split at h
-      · exact processHandshakeBuffer_phase_ne h hph
+      · rw [acceptTicket_eq'] at h
+        exact processHandshakeBuffer_phase_ne h hph
       · split at h
         · obtain ⟨_, h⟩ := unless_ok h
           split at h
@@ -3847,7 +3992,8 @@ private theorem processHandshakeBuffer_established {H : Spec.Hkdf} (hi : Impleme
       exact ⟨⟨wk, 0, hwk, hdw.protectsWith⟩, ⟨rk, 0, hrk, hdr.protectsWith⟩,
         completeServerHandshake_exporterMaster hi inp h1 h2 h3 h⟩
     · split at h
-      · have hw := processHandshakeBuffer_established hi h
+      · rw [acceptTicket_eq'] at h
+        have hw := processHandshakeBuffer_established hi h
         exact hw
       · split at h
         · obtain ⟨_, h⟩ := unless_ok h

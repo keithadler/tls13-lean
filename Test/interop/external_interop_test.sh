@@ -279,6 +279,16 @@ if [[ -n "${GO_SRC}" ]] && command -v go >/dev/null; then
       fail "go-hrr: handshake completed without exercising HelloRetryRequest"
     fi
   fi
+  # Resumption: two connections to one server sharing a session cache.
+  export TLS13_TEST_CONNECTIONS=2
+  if run_go go-resume -resume; then
+    if grep -q '^RESUMED true' "${SERVER_LOG}"; then
+      note "PASS go crypto/tls resumes with the Lean server's ticket ($(grep '^GO-RESUMED' "${WORK}/go-resume.log"))"
+    else
+      fail "go-resume: the server did not record a resumed handshake"
+    fi
+  fi
+  unset TLS13_TEST_CONNECTIONS
 else
   note "SKIP go crypto/tls cases: no go binary on PATH"
 fi
@@ -307,6 +317,45 @@ if run_openssl openssl-mtls \
   fi
 fi
 unset TLS13_TEST_CLIENT_CA
+
+# Session resumption (RFC 9846 §2.2) against the Lean server: s_client keeps
+# the harness's NewSessionTicket, then offers it to a fresh server process
+# (tickets are sealed under a fixed test key); the second handshake must be a
+# PSK resumption on both sides.
+SESSION="${WORK}/openssl-session.pem"
+start_server
+timeout 30 openssl s_client -connect "127.0.0.1:${PORT}" -tls1_3 -CAfile "${CERT}" \
+  -servername localhost -verify_return_error -ign_eof -sess_out "${SESSION}" \
+  </dev/null >"${WORK}/openssl-ticket.log" 2>&1
+finish_server
+start_server
+timeout 30 openssl s_client -connect "127.0.0.1:${PORT}" -tls1_3 -CAfile "${CERT}" \
+  -servername localhost -verify_return_error -ign_eof -sess_in "${SESSION}" \
+  </dev/null >"${WORK}/openssl-resume.log" 2>&1
+finish_server
+if [[ -s "${SESSION}" ]] && grep -q '^RESUMED true' "${SERVER_LOG}" \
+    && grep -q 'Reused, TLSv1.3' "${WORK}/openssl-resume.log"; then
+  note "PASS openssl s_client resumes with the Lean server's ticket"
+else
+  dump_case openssl-resume "${WORK}/openssl-resume.log"
+  fail "openssl-resume: the second connection did not resume"
+fi
+
+# Resumption through a HelloRetryRequest: the first flight's only share is
+# P-384, so the server retries to X25519, and the second ClientHello's binder
+# must cover message_hash || HelloRetryRequest || the truncated ClientHello.
+start_server
+timeout 30 openssl s_client -connect "127.0.0.1:${PORT}" -tls1_3 -CAfile "${CERT}" \
+  -servername localhost -verify_return_error -ign_eof -sess_in "${SESSION}" \
+  -groups P-384:X25519 </dev/null >"${WORK}/openssl-resume-hrr.log" 2>&1
+finish_server
+if server_saw_hrr && grep -q '^RESUMED true' "${SERVER_LOG}" \
+    && grep -q 'Reused, TLSv1.3' "${WORK}/openssl-resume-hrr.log"; then
+  note "PASS openssl s_client resumes through a HelloRetryRequest"
+else
+  dump_case openssl-resume-hrr "${WORK}/openssl-resume-hrr.log"
+  fail "openssl-resume-hrr: no resumption across the HelloRetryRequest"
+fi
 
 # --- The Lean client against OpenSSL s_server. ---
 # A throwaway CA and P-256 leaf for "localhost", made per run. s_server only
@@ -377,6 +426,23 @@ if [[ -n "${client_hex}" && "${client_hex^^}" == "${server_hex^^}" ]]; then
 else
   dump_case client-exporter "${log}"
   fail "client-exporter: keying material differs (lean=${client_hex:-none}, openssl=${server_hex:-none})"
+fi
+
+# The Lean client resumes with an OpenSSL ticket: s_server issues tickets on
+# the first connection, and must accept the client's PSK and binder on the
+# second.
+log="${WORK}/client-resume.log"
+start_openssl_server "${WORK}/s_server-resume.log" -www -naccept 2
+timeout 30 "${CLIENT_BIN}" "${PORT}" "${PKI}/ca.pem" --resume >"${log}" 2>&1
+rc=$?
+kill "${OPENSSL_PID}" 2>/dev/null || true
+wait "${OPENSSL_PID}" 2>/dev/null || true
+if [[ ${rc} -eq 0 ]] && grep -q 'resumed=true' "${log}" \
+    && [[ "$(grep -c '^RESPONSE HTTP/1.0 200' "${log}")" -eq 2 ]]; then
+  note "PASS lean client resumes with an openssl s_server ticket"
+else
+  dump_case client-resume "${log}"
+  fail "client-resume: the Lean client did not resume with s_server (rc=${rc})"
 fi
 
 if [[ ${FAILURES} -ne 0 ]]; then

@@ -98,3 +98,4 @@ meta if (get_config? hacl).isSome then do
   lean_exe tls_external_server where root := `Test.TlsExternalServer
   lean_exe tls_external_client where root := `Test.TlsExternalClient
   lean_exe tls_client_retry_test where root := `Test.TlsClientRetryTest
+  lean_exe tls_resumption_test where root := `Test.TlsResumptionTest

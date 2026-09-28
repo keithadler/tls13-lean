@@ -38,6 +38,19 @@ structure PeerAuthPolicy where
   requireExplicitPurpose : Bool := false
   deriving Inhabited
 
+/-- A session ticket, as the client keeps it (RFC 9846 §4.6.1): the opaque
+ticket the server issued, which is the PSK identity, the PSK it stands for, and
+what the client needs to offer it later. -/
+structure Ticket where
+  identity : ByteArray
+  psk : ByteArray
+  ageAdd : UInt32
+  /-- Seconds from receipt that the server will accept the ticket. -/
+  lifetime : UInt32
+  /-- The server's max_early_data_size for this ticket, 0 when absent. -/
+  maxEarlyData : UInt32 := 0
+  deriving Inhabited
+
 structure Config where
   clientRandom : ByteArray
   x25519Private : ByteArray
@@ -60,6 +73,12 @@ structure Config where
   /-- Required with client credentials: verify the server before disclosing a
   client certificate. Also usable without mTLS for in-engine verification. -/
   peerAuth : Option PeerAuthPolicy := none
+  /-- Offer this ticket to resume (RFC 9846 §2.2, psk_dhe_ke). A server that
+  accepts it authenticates with the PSK and sends no certificate; one that does
+  not runs a full handshake, verified as usual. -/
+  resumption : Option Ticket := none
+  /-- Milliseconds since `resumption` was received, for its obfuscated age. -/
+  ticketAgeMs : Nat := 0
   deriving Inhabited
 
 /-- Strict server-handshake ordering; CertificateRequest is consumed at the
@@ -220,6 +239,14 @@ structure State where
   helloConfig : Handshake.ClientHelloConfig := default
   /-- A HelloRetryRequest has been answered; RFC 9846 §4.1.4 forbids a second. -/
   retried : Bool := false
+  /-- The PSK this connection's ClientHello offers, if it resumes. -/
+  offeredPsk? : Option ByteArray := none
+  /-- The server accepted the offered PSK: no certificate is expected. -/
+  resumed : Bool := false
+  /-- RFC 9846 §7.1 `resumption_master_secret`, once connected. -/
+  resumptionMasterSecret? : Option ByteArray := none
+  /-- Tickets the server has sent on this connection, oldest first. -/
+  tickets : Array Ticket := #[]
   /-- ALPN protocol IDs advertised by this connection's ClientHello. -/
   offeredAlpnProtocols : Array String := #[]
   identity : Option Identity := none
@@ -394,6 +421,21 @@ private def checkIdentity (config : Config) : Except Error Unit := do
     unless config.peerAuth.isSome do
       throw (.badCertificate "client identity requires pre-disclosure server verification")
 
+/-- Fill in the PSK binder of a ClientHello that offers `psk` (RFC 9846
+§4.2.11.2): the HMAC, under the finished key of `Derive-Secret(Early Secret,
+"res binder", "")`, of the transcript before this ClientHello followed by the
+ClientHello truncated before its binders. -/
+def bindPsk (psk? : Option ByteArray) (beforeHello : ByteArray)
+    (hello : Handshake.Message) : Handshake.Message :=
+  match psk? with
+  | none => hello
+  | some psk =>
+    let binderKey := TLS13.KeySchedule.binderKey (TLS13.KeySchedule.earlySecret psk)
+      emptyTranscriptHash
+    Handshake.withPskBinder hello (finishedVerifyData binderKey (HaclStar.sha256
+      (beforeHello ++ Handshake.truncatedClientHello hello.encoded
+        Handshake.clientBindersLength)))
+
 /-- Create ClientHello and initial state from fresh caller-provided entropy.
 Credentials require an explicit server-verification policy. -/
 def start (config : Config) : Except Error Output := do
@@ -427,8 +469,14 @@ def start (config : Config) : Except Error Output := do
     legacySessionId := config.legacySessionId
     alpnProtocols := config.alpnProtocols
     offerP256 := p256PublicKey.isSome
+    pskOffer := config.resumption.map fun ticket => {
+      identity := ticket.identity
+      obfuscatedTicketAge :=
+        UInt32.ofNat ((config.ticketAgeMs + ticket.ageAdd.toNat) % 4294967296)
+    }
   }
   let hello ← liftHandshake <| Handshake.encodeClientHello helloConfig
+  let hello := bindPsk (config.resumption.map (·.psk)) ByteArray.empty hello
   let wireBytes ← liftRecord <| Record.encodePlaintext .handshake hello.encoded
   let state : State := {
     phase := .waitingServerHello
@@ -445,6 +493,7 @@ def start (config : Config) : Except Error Output := do
     supportedGroups :=
       if config.p256Private.isSome then #[.x25519, .secp256r1] else #[.x25519]
     helloConfig
+    offeredPsk? := config.resumption.map (·.psk)
     offeredAlpnProtocols := config.alpnProtocols
     identity := config.identity
     peerAuth := config.peerAuth
@@ -456,7 +505,7 @@ requirement that the selected cipher suite and key-share group are ones this
 connection's ClientHello actually offered. Factored out of `acceptServerHello`
 so that function stays a short chain of binds the engine laws can walk. -/
 private def checkServerHello (state : State) (hello : Handshake.ServerHello) :
-    Except Error Unit := do
+    Except Error (Option ByteArray) := do
   unless hello.legacySessionIdEcho == state.legacySessionId do
     throw (.illegalParameter
       "ServerHello legacy_session_id_echo does not match ClientHello")
@@ -467,6 +516,15 @@ private def checkServerHello (state : State) (hello : Handshake.ServerHello) :
     throw (.illegalParameter
       s!"server selected key-share group {hello.selectedGroup.toUInt16} \
         that the client did not offer")
+  -- RFC 9846 §4.2.11: a selected PSK must be the one this ClientHello offered.
+  match ← liftHandshake hello.selectedPsk? with
+  | none => pure none
+  | some index =>
+    let some psk := state.offeredPsk?
+      | throw (.illegalParameter "server selected a PSK the client did not offer")
+    unless index == 0 do
+      throw (.illegalParameter s!"server selected PSK identity {index} of 1")
+    pure (some psk)
 
 /-- Accept the ServerHello: check the echoed session id and the negotiated
 parameters, complete the key exchange, and install the RFC 8446 §7.1 handshake
@@ -478,7 +536,7 @@ def acceptServerHello (state : State) (message : Handshake.Message) :
   unless state.phase == .waitingServerHello do
     throw (.unexpectedHandshake state.phase message.msgType)
   let hello ← liftHandshake (Handshake.parseServerHello message)
-  checkServerHello state hello
+  let psk ← checkServerHello state hello
   let sharedSecret ← match hello.selectedGroup with
     | .x25519 =>
       let some sharedSecret :=
@@ -495,7 +553,7 @@ def acceptServerHello (state : State) (message : Handshake.Message) :
     throw (.internalState
       s!"ECDHE returned a {sharedSecret.size}-byte shared secret")
 
-  let earlySecret := TLS13.KeySchedule.earlySecret
+  let earlySecret := TLS13.KeySchedule.earlySecret (psk.getD TLS13.KeySchedule.zeros)
   let handshakeSecret :=
     TLS13.KeySchedule.handshakeSecret earlySecret sharedSecret emptyTranscriptHash
   let transcript := state.transcript ++ message.encoded
@@ -511,6 +569,7 @@ def acceptServerHello (state : State) (message : Handshake.Message) :
     phase := .waitingEncryptedExtensions
     handshakeBuffered := ByteArray.empty
     transcript
+    resumed := psk.isSome
     handshakeSecret? := some handshakeSecret
     clientHandshakeTrafficSecret? := some clientTrafficSecret
     serverHandshakeTrafficSecret? := some serverTrafficSecret
@@ -588,6 +647,10 @@ def acceptHelloRetryRequest (state : State) (message : Handshake.Message) :
   }
   let messageHash ← liftHandshake
     (Handshake.frame Handshake.messageHashType (HaclStar.sha256 state.transcript))
+  -- The binder of the second ClientHello covers message_hash and the
+  -- HelloRetryRequest too (RFC 9846 §4.2.11.2).
+  let secondHello := bindPsk state.offeredPsk? (messageHash.encoded ++ message.encoded)
+    secondHello
   let wireBytes ← liftRecord (Record.encodePlaintext .handshake secondHello.encoded)
   pure ({
     state with
@@ -636,6 +699,9 @@ private def clientAuthentication (state : State) (transcript : ByteArray) :
     pure (certificate.encoded ++ verify.encoded)
 
 private def verifyServerIdentity (state : State) : Except Error Unit := do
+  -- A resumed session was authenticated when its ticket was issued.
+  if state.resumed then
+    return
   if let some policy := state.peerAuth then
     let some leaf := state.peerCertificates[0]?
       | throw (.badCertificate "missing peer certificate")
@@ -699,6 +765,10 @@ def completeServerHandshake (state : State) (message : Handshake.Message) :
     else
       liftRecord (Record.encodePlaintext .changeCipherSpec (ByteArray.empty.push 1))
   let wireBytes := compatibilityWireBytes ++ finishedWireBytes
+  -- RFC 9846 §7.1: resumption_master_secret binds ClientHello…client Finished.
+  let resumptionMasterSecret := TLS13.KeySchedule.deriveSecret masterSecret "res master"
+    (HaclStar.sha256 (transcriptThroughServerFinished ++ authentication ++
+      clientFinished.encoded))
   pure ({
     state with
     phase := .connected
@@ -724,6 +794,8 @@ def completeServerHandshake (state : State) (message : Handshake.Message) :
     readKeys? := some serverApplicationKeys
     writeKeys? := some clientApplicationKeys
     exporterMasterSecret? := some exporterMasterSecret
+    resumptionMasterSecret? := some resumptionMasterSecret
+    offeredPsk? := none
     sendingKeyUpdates := 0
   }, wireBytes)
 
@@ -902,6 +974,43 @@ private theorem acceptKeyUpdate_buffered {state next : State}
                     rfl
                   · rw [sendKeyUpdate_buffered h]
 
+/-- Keep a NewSessionTicket (RFC 9846 §4.6.1): its PSK is the resumption master
+secret expanded under "resumption" with the ticket's nonce. A ticket that does
+not parse is dropped, which only means no resumption with it. -/
+def acceptTicket (state : State) (message : Handshake.Message) : State :=
+  match state.resumptionMasterSecret?, Handshake.parseNewSessionTicket message with
+  | some resumptionMaster, .ok ticket =>
+    let maxEarlyData := match ticket.extensions.find?
+        (·.extensionType == Handshake.earlyDataExtension) with
+      | some extension =>
+        UInt32.ofNat (extension.data.foldl (fun acc b => acc * 256 + b.toNat) 0)
+      | none => 0
+    { state with tickets := state.tickets.push {
+        identity := ticket.ticket
+        psk := TLS13.KeySchedule.ticketPsk resumptionMaster ticket.ticketNonce
+        ageAdd := ticket.ticketAgeAdd
+        lifetime := ticket.ticketLifetime
+        maxEarlyData } }
+  | _, _ => state
+
+theorem acceptTicket_buffered (state : State) (message : Handshake.Message) :
+    (acceptTicket state message).handshakeBuffered = state.handshakeBuffered := by
+  unfold acceptTicket; split <;> rfl
+
+/-- Keeping a ticket changes nothing but the ticket list, as an equation. -/
+theorem acceptTicket_eq' (state : State) (message : Handshake.Message) :
+    acceptTicket state message =
+      { state with tickets := (acceptTicket state message).tickets } := by
+  unfold acceptTicket; split <;> rfl
+
+/-- Keeping a ticket changes nothing but the ticket list. -/
+theorem acceptTicket_eq (state : State) (message : Handshake.Message) :
+    ∃ tickets, acceptTicket state message = { state with tickets } := by
+  unfold acceptTicket
+  split
+  · exact ⟨_, rfl⟩
+  · exact ⟨state.tickets, rfl⟩
+
 /-- Consume every complete handshake message the buffer holds, in phase order:
 EncryptedExtensions, Certificate, CertificateVerify, then the server Finished
 that establishes the connection. Public (but not `@[expose]`d) so
@@ -928,7 +1037,10 @@ def processHandshakeBuffer (state : State) :
             throw (.illegalParameter
               s!"server selected ALPN protocol {protocol} that the client did not offer")
         processHandshakeBuffer (appendTranscript
-          { state' with phase := .waitingCertificate, alpnSelected } message)
+          { state' with
+            -- A resumed handshake has no Certificate or CertificateVerify.
+            phase := if state'.resumed then .waitingServerFinished else .waitingCertificate
+            alpnSelected } message)
     | .waitingCertificate => do
         if message.msgType == Handshake.certificateRequestType then
           if state'.certificateRequested then
@@ -981,9 +1093,7 @@ def processHandshakeBuffer (state : State) :
         completeServerHandshake state' message
     | .connected =>
         if message.msgType == Handshake.newSessionTicketType then
-          -- This profile does not implement resumption. RFC 9846 §4.7.1
-          -- requires such a client to silently ignore NewSessionTicket.
-          processHandshakeBuffer state'
+          processHandshakeBuffer (acceptTicket state' message)
         else if message.msgType == Handshake.keyUpdateType then do
           unless rest.isEmpty do
             -- A KeyUpdate changes the record-protection epoch, so it must end
@@ -1008,6 +1118,8 @@ def processHandshakeBuffer (state : State) :
       | exact hbuf
       | exact hrest
       | (simp only [appendTranscript_buffered]
+         exact hrest)
+      | (rw [acceptTicket_buffered]
          exact hrest)
 
 private def validCompatibilityChangeCipherSpec (fragment : ByteArray) : Bool :=

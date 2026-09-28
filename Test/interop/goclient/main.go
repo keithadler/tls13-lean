@@ -27,6 +27,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8443", "server address")
 	caFile := flag.String("cafile", "Test/Fixtures/Tls/server_cert.pem", "root CA PEM")
 	hrr := flag.Bool("hrr", false, "offer no usable first-flight key share to force HelloRetryRequest")
+	resume := flag.Bool("resume", false, "connect twice sharing a session cache; the second must resume")
 	flag.Parse()
 
 	pem, err := os.ReadFile(*caFile)
@@ -55,7 +56,26 @@ func main() {
 		cfg.CurvePreferences = []tls.CurveID{tls.X25519MLKEM768, tls.CurveP256}
 	}
 
-	conn, err := tls.Dial("tcp", *addr, cfg)
+	if *resume {
+		// RFC 9846 §2.2: the first connection receives a NewSessionTicket and
+		// the second offers it; Go reports whether the server accepted it.
+		cfg.ClientSessionCache = tls.NewLRUClientSessionCache(4)
+		first := fetch(*addr, cfg)
+		second := fetch(*addr, cfg)
+		fmt.Printf("GO-RESUMED first=%v second=%v\n", first, second)
+		if first || !second {
+			fatal("expected a full handshake, then a resumed one")
+		}
+		fmt.Println("GO-OK")
+		return
+	}
+	fetch(*addr, cfg)
+	fmt.Println("GO-OK")
+}
+
+// fetch makes one connection, checks the page, and reports DidResume.
+func fetch(addr string, cfg *tls.Config) bool {
+	conn, err := tls.Dial("tcp", addr, cfg)
 	if err != nil {
 		fatal("dial: %v", err)
 	}
@@ -86,7 +106,7 @@ func main() {
 	if !strings.HasPrefix(text, "HTTP/1.1 200") {
 		fatal("expected HTTP/1.1 200, got %q", firstLine(text))
 	}
-	fmt.Println("GO-OK")
+	return conn.ConnectionState().DidResume
 }
 
 func firstLine(s string) string {

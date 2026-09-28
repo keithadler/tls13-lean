@@ -107,6 +107,58 @@ private def parseArgs (args : List String) : IO (UInt16 × UInt64) := do
     throw (IO.userError "read size must be positive")
   pure (UInt16.ofNat port, UInt64.ofNat readSize)
 
+/-- One connection: handshake, a session ticket, a KeyUpdate, the page, and
+close_notify, logging what the gate checks. -/
+private def serveOne (client : TCP.Socket.Client) (readSize : UInt64)
+    (config : Server.Config) : IO Unit := do
+  let connected ← completeHandshake client readSize (Server.start config)
+  logLine s!"NEGOTIATED suite={connected.cipherSuiteSelected} group={repr connected.groupSelected}"
+  logLine s!"RESUMED {connected.resumed}"
+  logLine s!"CLIENT_CERTIFICATES {connected.peerCertificates.size}"
+  -- RFC 9846 §7.5 exported keying material, compared by the interop gate with
+  -- what the client exports for the same label and an empty context.
+  match Server.exportKeyingMaterial connected "EXPERIMENTAL-tls13-lean".toUTF8
+      ByteArray.empty 32 with
+  | .ok material => logLine s!"EXPORTER {HaclStar.Hex.encode material}"
+  | .error error => logLine s!"EXPORTER-ERROR {error}"
+  if connected.peerClosed then
+    logLine "peer closed immediately after the handshake"
+  else
+    -- RFC 9846 §4.6.1: a session ticket the client may resume with.
+    let ageAdd ← IO.getRandomBytes 4
+    let sealNonce ← IO.getRandomBytes 12
+    let ticketed ←
+      match Server.issueTicket connected
+          (UInt32.ofNat (ageAdd.foldl (fun acc b => acc * 256 + b.toNat) 0)) sealNonce with
+      | .error error => throw (IO.userError s!"TLS NewSessionTicket: {error}")
+      | .ok output =>
+          sendBytes client output.wireBytes
+          logLine "TICKET sent"
+          pure output.state
+    -- A tiny response lets curl exercise the same TLS endpoint without
+    -- turning this interoperability harness into a full HTTP server.
+    let response :=
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".toUTF8
+    -- RFC 9846 §4.6.3: move to a new sending epoch, asking the client to
+    -- do the same, before the response; each client must read the page
+    -- under the updated keys.
+    let updated ←
+      match Server.updateKeys ticketed (requestPeer := true) with
+      | .error error => throw (IO.userError s!"TLS KeyUpdate: {error}")
+      | .ok output =>
+          sendBytes client output.wireBytes
+          logLine "KEYUPDATE sent update_requested"
+          pure output.state
+    let responded ←
+      match Server.sealApplication updated response with
+      | .error error => throw (IO.userError s!"TLS application response: {error}")
+      | .ok output =>
+          sendBytes client output.wireBytes
+          pure output.state
+    match Server.closeNotify responded with
+    | .error error => throw (IO.userError s!"TLS close_notify: {error}")
+    | .ok output => sendBytes client output.wireBytes
+
 def main (args : List String) : IO Unit := do
   let (port, readSize) ← parseArgs args
   let pem ← IO.FS.readFile "Test/Fixtures/Tls/server_cert.pem"
@@ -157,43 +209,18 @@ def main (args : List String) : IO Unit := do
   })
   listener.listen 1
   logLine s!"READY 127.0.0.1:{port}"
-
-  let client ← listener.accept.block
-  try
-    let connected ← completeHandshake client readSize (Server.start config)
-    logLine s!"NEGOTIATED suite={connected.cipherSuiteSelected} group={repr connected.groupSelected}"
-    logLine s!"CLIENT_CERTIFICATES {connected.peerCertificates.size}"
-    -- RFC 9846 §7.5 exported keying material, compared by the interop gate with
-    -- what the client exports for the same label and an empty context.
-    match Server.exportKeyingMaterial connected "EXPERIMENTAL-tls13-lean".toUTF8
-        ByteArray.empty 32 with
-    | .ok material => logLine s!"EXPORTER {HaclStar.Hex.encode material}"
-    | .error error => logLine s!"EXPORTER-ERROR {error}"
-    if connected.peerClosed then
-      logLine "peer closed immediately after the handshake"
-    else
-      -- A tiny response lets curl exercise the same TLS endpoint without
-      -- turning this interoperability harness into a full HTTP server.
-      let response :=
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".toUTF8
-      -- RFC 9846 §4.6.3: move to a new sending epoch, asking the client to
-      -- do the same, before the response; each client must read the page
-      -- under the updated keys.
-      let updated ←
-        match Server.updateKeys connected (requestPeer := true) with
-        | .error error => throw (IO.userError s!"TLS KeyUpdate: {error}")
-        | .ok output =>
-            sendBytes client output.wireBytes
-            logLine "KEYUPDATE sent update_requested"
-            pure output.state
-      let responded ←
-        match Server.sealApplication updated response with
-        | .error error => throw (IO.userError s!"TLS application response: {error}")
-        | .ok output =>
-            sendBytes client output.wireBytes
-            pure output.state
-      match Server.closeNotify responded with
-      | .error error => throw (IO.userError s!"TLS close_notify: {error}")
-      | .ok output => sendBytes client output.wireBytes
-  finally
-    try (client.shutdown).block catch _ => pure ()
+  -- TLS13_TEST_CONNECTIONS serves that many connections in turn (default one),
+  -- so a client can resume on the second with a ticket from the first.
+  let connections := ((← IO.getEnv "TLS13_TEST_CONNECTIONS").bind (·.toNat?)).getD 1
+  for _ in [0:connections] do
+    -- Fresh randomness per connection, and a fixed ticket key so that tickets
+    -- also survive a restart of this harness between two gate cases.
+    let serverRandom ← IO.getRandomBytes 32
+    let x25519Private ← IO.getRandomBytes 32
+    let nowMs := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.toInt.toNat * 1000
+    let client ← listener.accept.block
+    try
+      serveOne client readSize { config with
+        serverRandom, x25519Private, ticketKey := some (fill 32 0x5a), nowMs }
+    finally
+      try (client.shutdown).block catch _ => pure ()

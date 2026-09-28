@@ -188,6 +188,38 @@ theorem deriveSecret_node_spec {H : Spec.Hkdf} (hi : Implements H)
   rw [hparent, ← hhash]
   exact derived_spec hi inp d
 
+/-! ## Resumption -/
+
+/-- **A ticket's PSK is RFC 9846 §4.6.1's**:
+`HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce,
+Hash.length)`. -/
+theorem ticketPsk_spec {H : Spec.Hkdf} (hi : Implements H)
+    (resumptionMaster ticketNonce : ByteArray) :
+    ticketPsk resumptionMaster ticketNonce =
+      Spec.ticketPsk H resumptionMaster ticketNonce := by
+  unfold ticketPsk Spec.ticketPsk
+  rw [← hi.hashLen_eq, show "resumption" = Spec.Label.text .resumption from rfl,
+    expandLabel_spec hi]
+
+/-- **The binder key is §7.1's `binder_key` for a resumption PSK**: the
+`"res binder"` node over the empty transcript, hung off the Early Secret of
+the PSK being offered. -/
+theorem binderKey_spec {H : Spec.Hkdf} (hi : Implements H) (inp : Spec.Inputs)
+    {emptyHash : ByteArray} (hempty : inp.hash .empty = emptyHash) :
+    binderKey (earlySecret inp.psk) emptyHash = Spec.derived H inp .resBinder :=
+  deriveSecret_node_spec hi inp .resBinder (earlySecret_spec hi inp) hempty
+
+/-- The Handshake Secret as an engine builds it when resuming: the Early Secret
+of the PSK, then the (EC)DHE secret, as in `handshakeSecret_node_spec` but for
+any PSK rather than the all-zero one. -/
+theorem handshakeSecret_psk_node_spec {H : Spec.Hkdf} (hi : Implements H)
+    (inp : Spec.Inputs) {psk shared emptyHash : ByteArray} (hpsk : inp.psk = psk)
+    (hecdhe : inp.ecdhe = shared) (hempty : inp.hash .empty = emptyHash) :
+    handshakeSecret (earlySecret psk) shared emptyHash = Spec.secret H inp .handshake := by
+  have h := handshakeSecret_spec hi inp
+  rw [hpsk, hecdhe, hempty] at h
+  exact h
+
 /-! ## Exporters -/
 
 /-- **`exporter` is RFC 9846 §7.5's `TLS-Exporter`**: a `Derive-Secret` under

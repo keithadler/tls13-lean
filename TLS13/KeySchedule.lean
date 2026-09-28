@@ -67,6 +67,15 @@ def handshakeSecret (early ecdheSecret emptyHash : ByteArray) : ByteArray :=
 def masterSecret (handshake emptyHash : ByteArray) : ByteArray :=
   Hkdf.extractSha256 (deriveSecret handshake "derived" emptyHash) zeros
 
+/-- RFC 9846 §4.6.1: the PSK a NewSessionTicket with this nonce stands for. -/
+def ticketPsk (resumptionMasterSecret ticketNonce : ByteArray) : ByteArray :=
+  expandLabel resumptionMasterSecret "resumption" ticketNonce hashLen
+
+/-- The resumption binder key (RFC 9846 §7.1): `Derive-Secret(Early Secret,
+"res binder", "")`. -/
+def binderKey (early emptyHash : ByteArray) : ByteArray :=
+  deriveSecret early "res binder" emptyHash
+
 /-- Why an exporter request cannot be served, or `none` when it can. The
 application's label becomes the `Label` of an `HkdfLabel`, whose
 `"tls13 " + Label` is an `opaque<7..255>`, so it may be at most 249 bytes; and

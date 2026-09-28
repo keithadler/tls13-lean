@@ -100,6 +100,8 @@ inductive Label where
   | trafficUpd
   /-- §7.5, the second expansion of `TLS-Exporter`. -/
   | exporter
+  /-- §4.6.1, the PSK a NewSessionTicket carries. -/
+  | resumption
   deriving Repr, BEq, DecidableEq, Inhabited
 
 /-- The exact label strings of RFC 8446. -/
@@ -120,6 +122,7 @@ inductive Label where
   | .finished => "finished"
   | .trafficUpd => "traffic upd"
   | .exporter => "exporter"
+  | .resumption => "resumption"
 
 /-- **The labels are RFC 8446's, spelled out.** A typo anywhere in `Label.text`
 fails this theorem, and every derivation below names a `Label` rather than a
@@ -140,8 +143,9 @@ theorem Label.text_rfc8446 :
     Label.text .iv = "iv" ∧
     Label.text .finished = "finished" ∧
     Label.text .trafficUpd = "traffic upd" ∧
-    Label.text .exporter = "exporter" :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    Label.text .exporter = "exporter" ∧
+    Label.text .resumption = "resumption" :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## The `HkdfLabel` wire structure
 
@@ -409,6 +413,17 @@ theorem emptyContext_rfc8446 (H : Hkdf) (s : ByteArray) (keyLength ivLength : Na
     finishedKey H s = expandLabel H s .finished ByteArray.empty H.hashLen ∧
     nextTrafficSecret H s = expandLabel H s .trafficUpd ByteArray.empty H.hashLen :=
   ⟨rfl, rfl, rfl, rfl⟩
+
+/-! ## Session tickets
+
+RFC 9846 §4.6.1: each NewSessionTicket carries a nonce, and the PSK it stands
+for is the resumption master secret expanded under `"resumption"` with that
+nonce, so the tickets of one connection carry distinct PSKs. -/
+
+/-- `HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce,
+Hash.length)`. -/
+@[expose] def ticketPsk (H : Hkdf) (resumptionMaster ticketNonce : ByteArray) : ByteArray :=
+  expandLabel H resumptionMaster .resumption ticketNonce H.hashLen
 
 /-! ## Keying material exporters
 

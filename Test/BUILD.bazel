@@ -70,6 +70,15 @@ lean_test(
     deps = ["//Tls:tls"],
 )
 
+# Session tickets and PSK resumption between the two engines: tickets, a
+# resumed handshake without certificates, binder failure, and fallbacks.
+lean_test(
+    name = "tls_resumption_test",
+    srcs = ["TlsResumptionTest.lean"],
+    data = ["Fixtures/Tls/server_cert.pem"],
+    deps = ["//Tls:tls"],
+)
+
 # The client-side counterpart: drives Tls.Client against an external server.
 lean_binary(
     name = "tls_external_client",

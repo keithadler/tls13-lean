@@ -156,10 +156,20 @@ laws then prove the implementation computes it. Read the fine print:
   roles) refines RFC 9846 §7.5's `TLS-Exporter` (`Spec.exporter`,
   `exporter_rfc9846`). The interop gate checks the exported bytes against
   OpenSSL and Go.
-- Not covered: the PSK/early-data branches (`ext binder`, `res binder`,
-  `c e traffic`, `e exp master`) and the resumption output (`res master`) are
-  in the specification but this implementation does not compute them, so there
-  is nothing to refine — see [Protocol scope](#protocol-scope).
+- Resumption: the PSK a ticket carries (`ticketPsk_spec`, RFC 9846 §4.6.1),
+  the binder key (`binderKey_spec`, the `res binder` node) and the binder
+  itself on both sides (`Tls.Client.bindPsk_spec`, `Tls.Server.choosePsk_binder`),
+  a resumed server flight keyed by the PSK's Early Secret
+  (`Tls.Server.completePskClientHello_keySchedule`; the client's
+  `acceptServerHello_keySchedule` allows only zeros or the offered PSK), and
+  `resumption_master_secret` in both roles
+  (`completeServerHandshake_resumptionMaster`,
+  `acceptClientFinished_resumptionMaster`); a kept ticket's PSK is
+  `acceptTicket_psk`.
+- Not covered: the early-data branches (`c e traffic`, `e exp master`) and
+  external PSKs (`ext binder`) are in the specification but this
+  implementation does not compute them, so there is nothing to refine — see
+  [Protocol scope](#protocol-scope).
 
 What is **not** claimed: no security proof of the handshake or state machines,
 no cryptographic correctness of HKDF, the AEAD, the hashes, or the signature
@@ -393,6 +403,19 @@ Implemented and negotiated:
   is no outstanding-request state to manage. It also responds per requested record while processing a
   feed; a batch containing several requested KeyUpdates is not collapsed into
   one deferred response.
+- **Session resumption** (RFC 9846 §2.2, §4.2.11, §4.6.1), in both roles and
+  with psk_dhe_ke only, so every resumed connection still runs (EC)DHE. A
+  server with a 32-byte `ticketKey` sends tickets with `issueTicket` (or
+  `Op.issueTicket`) and resumes the ones it sealed: a ticket is ChaCha20-Poly1305
+  over the PSK, ticket_age_add, issue time and lifetime, so the server keeps no
+  session state, and one it did not seal, or one past its lifetime, just means
+  a full handshake. The caller supplies `nowMs` and, per ticket, a random
+  ticket_age_add and seal nonce. A bad binder fails with decrypt_error; a
+  server that requires client certificates does not resume, since a ticket
+  records no client identity. The client keeps the tickets it receives
+  (`state.tickets`), offers one with `Config.resumption`, recomputes the binder
+  after a HelloRetryRequest, and skips Certificate/CertificateVerify when the
+  server accepts.
 - **Keying material exporters** (RFC 9846 §7.5, RFC 5705's interface):
   `exportKeyingMaterial state label context length` in both roles, once
   connected. Labels up to 249 bytes and lengths up to `255 * 32` bytes, the
@@ -404,10 +427,8 @@ Implemented and negotiated:
   a crossing requested KeyUpdate advances only the read epoch, and
   `sealFatalAlert` returns `connectionClosed`.
 
-Unsupported: PSK and session resumption
-(NewSessionTicket is silently ignored without semantically parsing its body;
-the server never issues tickets),
-0-RTT, the early exporter and resumption secrets, post-handshake client authentication,
+Unsupported: external (non-ticket) PSKs and psk_ke, 0-RTT and the early exporter,
+post-handshake client authentication,
 AES-GCM suites, and post-quantum
 hybrid groups (a hybrid key share in a
 ClientHello is tolerated and skipped, not negotiated). The server's
@@ -561,8 +582,8 @@ test binary is built, so a violation is a red target, not a stale README:
 | Target | What it certifies |
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
-| `//TLS13:tls13_assurance` | 25 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Main (compatibility theorem identifier `masterSecret_spec`)/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies`, and `Chain.validate_leaf_keyUsage` |
-| `//Tls:tls_assurance` | 101 principal theorems — finite write traces (`WriteRun.nodup`, `AeadWriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, the schedule-refined `run_nonce_trace_spec`/`start_run_nonce_trace_spec`, `run_epochs`, and nonce/sequence injectivity), record conservation, the exact `TLSInnerPlaintext` bound, and seal/open inversion; ClientHello canonicity and body injectivity; the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary); and the state-machine transition and invariant laws, including KeyUpdate limit/error behavior, no output after local closure, directional peer closure, both directions of the connected-only application-data rule, and both engines' no-epoch-before-the-first-flight clauses |
+| `//TLS13:tls13_assurance` | 27 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Main (compatibility theorem identifier `masterSecret_spec`)/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies`, and `Chain.validate_leaf_keyUsage` |
+| `//Tls:tls_assurance` | 107 principal theorems — finite write traces (`WriteRun.nodup`, `AeadWriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, the schedule-refined `run_nonce_trace_spec`/`start_run_nonce_trace_spec`, `run_epochs`, and nonce/sequence injectivity), record conservation, the exact `TLSInnerPlaintext` bound, and seal/open inversion; ClientHello canonicity and body injectivity; the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary); and the state-machine transition and invariant laws, including KeyUpdate limit/error behavior, no output after local closure, directional peer closure, both directions of the connected-only application-data rule, and both engines' no-epoch-before-the-first-flight clauses |
 
 Each target also scans every constant of the full 28-module first-party closure
 (`HaclStar`, `TLS13`, `Tls`): nothing may reach
@@ -583,6 +604,7 @@ audits above:
 | --- | --- |
 | `hacl_kat_test` | Coverage for every binding, using published vectors where available: SHA-2 (FIPS 180), HMAC (RFC 4231), HKDF (RFC 5869), X25519 (RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) + tamper detection, Ed25519 (RFC 8032), ECDSA roundtrip, RFC 6979 A.2.5 deterministic P-256 nonces and signatures through the DER encoder, and broad RFC 8448 key-schedule checkpoints plus a hand-encoded `HkdfLabel`; it also exercises HKDF's expansion ceiling and rejects malformed X25519/AEAD dimensions at the FFI boundary |
 | `tls_handshake_test` | Wire codecs against a GREASE-laden, fragmented, reordered ClientHello; record reassembly across TCP boundaries; missing-extension and duplicate-extension alerts; the full HelloRetryRequest flow |
+| `tls_resumption_test` | Tickets and PSK resumption between the two engines: two tickets with distinct PSKs, a resumed handshake without certificates whose exports agree, a ticket from the resumed connection, decrypt_error on a tampered binder, and full-handshake fallbacks for an expired ticket, another ticket key, and a server without tickets |
 | `tls_client_retry_test` | Client HelloRetryRequest: the one-share second ClientHello, cookie echo, the `message_hash` transcript, the server's own §4.1.2 retry check on it, the ServerHello that must match, and seven refusals with their alerts |
 | `tls_record_test` | RFC 9846's exact `TLSInnerPlaintext` boundary for both seal and open, plus rejection one byte above it |
 | `tls_server_interop_test` | Authenticated handshake between this repo's client and server engines (no sockets): negotiation, sender-side leaf policy, three-record server flight, application data both ways, 50-certificate fragmentation, KeyUpdate ordering/limits/errors (including crossing requests after local close), unsupported-ticket handling, alert classification, and directional closure behavior |
@@ -609,6 +631,10 @@ HTTP/1.1 200 body:
 - RFC 9846 §7.5 exported keying material: OpenSSL (`-keymatexport`) and Go
   (`ExportKeyingMaterial`) must each export exactly the bytes the server
   exports for the same label;
+- resumption with the server's tickets: OpenSSL (`-sess_out`, then `-sess_in`
+  against a restarted server, also through a HelloRetryRequest) and Go (two
+  connections sharing a session cache) must both resume;
+- the Lean client resuming with a ticket `s_server` issued;
 - the Lean *client* (`tls_external_client`) against OpenSSL `s_server
   -groups P-256`, with a per-run CA and P-256 leaf: the server must send a
   HelloRetryRequest, the retried handshake must fetch a page, and the client's

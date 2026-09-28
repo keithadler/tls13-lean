@@ -60,17 +60,12 @@ private partial def readResponse (socket : TCP.Socket.Client) (state : Client.St
             sendBytes socket output.wireBytes
             readResponse socket output.state (received ++ output.plaintext)
 
-def main (args : List String) : IO Unit := do
-  let (encodedPort, caPath, hrr) ← match args with
-    | [port, ca] => pure (port, ca, false)
-    | [port, ca, "--p256-hrr"] => pure (port, ca, true)
-    | _ => throw (IO.userError "usage: tls_external_client PORT CA-PEM [--p256-hrr]")
-  let some port := encodedPort.toNat?
-    | throw (IO.userError s!"invalid TCP port: {encodedPort}")
-  let trustStore ← match TLS13.X509.Chain.TrustStore.decodePEM (← IO.FS.readFile caPath) with
-    | .ok store => pure store
-    | .error error => throw (IO.userError error)
-  let now := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.toInt
+/-- One connection: handshake (resuming with `resumption` if given), export,
+a KeyUpdate, `GET /`, and the reply, logging what the gate checks. Returns the
+final state, which holds the tickets the server sent. -/
+private def connectOnce (port : Nat) (trustStore : TLS13.X509.Chain.TrustStore) (now : Int)
+    (hrr : Bool) (resumption : Option Client.Ticket) (ticketAgeMs : Nat) :
+    IO Client.State := do
   let clientRandom ← IO.getRandomBytes 32
   let x25519Private ← IO.getRandomBytes 32
   let p256Scalar ← IO.getRandomBytes 32
@@ -82,17 +77,18 @@ def main (args : List String) : IO Unit := do
     serverName := some "localhost"
     alpnProtocols := #["http/1.1"]
     peerAuth := some { trustStore, now, hostname := "localhost" }
+    resumption
+    ticketAgeMs
   }
   let started ← match Client.start config with
     | .ok output => pure output
     | .error error => throw (IO.userError s!"TLS client start: {error}")
-
   let socket ← TCP.Socket.Client.mk
   (socket.connect (.v4 { addr := Std.Net.IPv4Addr.ofParts 127 0 0 1, port := UInt16.ofNat port })).block
   try
     sendBytes socket started.wireBytes
     let connected ← completeHandshake socket started.state
-    logLine s!"NEGOTIATED retried={connected.retried} alpn={connected.alpnSelected}"
+    logLine s!"NEGOTIATED retried={connected.retried} resumed={connected.resumed} alpn={connected.alpnSelected}"
     match Client.exportKeyingMaterial connected "EXPERIMENTAL-tls13-lean".toUTF8
         ByteArray.empty 32 with
     | .ok material => logLine s!"EXPORTER {HaclStar.Hex.encode material}"
@@ -111,7 +107,27 @@ def main (args : List String) : IO Unit := do
     sendBytes socket sent.wireBytes
     let (response, final) ← readResponse socket sent.state ByteArray.empty
     logLine s!"PEER_UPDATED {final.readKeys?.map (·.secret) != readSecret}"
+    logLine s!"TICKETS {final.tickets.size}"
     let text := String.fromUTF8? response |>.getD ""
     logLine s!"RESPONSE {(text.splitOn "\r\n").headD ""}"
+    pure final
   finally
     try (socket.shutdown).block catch _ => pure ()
+
+def main (args : List String) : IO Unit := do
+  let (encodedPort, caPath, mode) ← match args with
+    | [port, ca] => pure (port, ca, "")
+    | [port, ca, flag] => pure (port, ca, flag)
+    | _ => throw (IO.userError "usage: tls_external_client PORT CA-PEM [--p256-hrr|--resume]")
+  let some port := encodedPort.toNat?
+    | throw (IO.userError s!"invalid TCP port: {encodedPort}")
+  let trustStore ← match TLS13.X509.Chain.TrustStore.decodePEM (← IO.FS.readFile caPath) with
+    | .ok store => pure store
+    | .error error => throw (IO.userError error)
+  let now := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.toInt
+  let first ← connectOnce port trustStore now (mode == "--p256-hrr") none 0
+  if mode == "--resume" then
+    -- RFC 9846 §2.2: offer the first connection's ticket on a second one.
+    let some ticket := first.tickets[0]?
+      | throw (IO.userError "the server sent no ticket to resume with")
+    let _ ← connectOnce port trustStore now false (some ticket) 1000

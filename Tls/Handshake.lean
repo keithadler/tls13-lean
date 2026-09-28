@@ -446,6 +446,18 @@ private def requireExtension (extensions : Array Extension) (extensionType : UIn
     | throw s!"ServerHello is missing {name}"
   pure ext
 
+/-- `psk_dhe_ke` (RFC 9846 §4.2.9): a PSK combined with an (EC)DHE exchange,
+the only PSK key exchange mode this stack offers or accepts, so every resumed
+connection keeps forward secrecy. -/
+def pskDheKe : UInt8 := 1
+
+/-- A PSK a ClientHello offers: the ticket, which is the identity, and the
+obfuscated ticket age (RFC 9846 §4.2.11). -/
+structure PskOffer where
+  identity : ByteArray
+  obfuscatedTicketAge : UInt32
+  deriving Inhabited
+
 /-- Inputs whose values must be freshly generated for each ClientHello. -/
 structure ClientHelloConfig where
   random : ByteArray
@@ -464,6 +476,10 @@ structure ClientHelloConfig where
   /-- The cookie extension body a HelloRetryRequest carried, echoed verbatim in
   the second ClientHello (RFC 9846 §4.2.2). -/
   cookie : Option ByteArray := none
+  /-- Offer one PSK with psk_dhe_ke. The binder is a 32-byte placeholder that
+  `withPskBinder` replaces once it has been computed over
+  `truncatedClientHello`. -/
+  pskOffer : Option PskOffer := none
   deriving Inhabited
 
 /-- Encode a client ALPN offer: a ProtocolNameList of length-prefixed names. -/
@@ -525,6 +541,41 @@ private def cookieExtensionBytes : Option ByteArray → Except String ByteArray
   | none => pure ByteArray.empty
   | some body => encodeExtension cookieExtension body
 
+/-- psk_key_exchange_modes offering psk_dhe_ke, or nothing. -/
+private def pskModesExtensionBytes : Bool → Except String ByteArray
+  | false => pure ByteArray.empty
+  | true => do
+    encodeExtension pskKeyExchangeModesExtension (← encodeVector8 (ByteArray.empty.push pskDheKe))
+
+/-- The binders list a ClientHello offering one PSK ends with: a uint16 list
+length, a one-byte binder length and the 32-byte binder. -/
+def clientBindersLength : Nat := 35
+
+/-- The pre_shared_key extension for one PSK with a zero placeholder binder,
+or nothing. It must be the last extension (RFC 9846 §4.2.11). -/
+private def preSharedKeyExtensionBytes : Option PskOffer → Except String ByteArray
+  | none => pure ByteArray.empty
+  | some offer => do
+    let identity := (← encodeVector16 offer.identity) ++
+      appendUInt32 ByteArray.empty offer.obfuscatedTicketAge
+    let identities ← encodeVector16 identity
+    let binders ← encodeVector16
+      (← encodeVector8 (ByteArray.mk (List.replicate 32 (0 : UInt8)).toArray))
+    encodeExtension preSharedKeyExtension (identities ++ binders)
+
+/-- The part of a ClientHello a PSK binder covers (RFC 9846 §4.2.11.2): the
+whole message, handshake header included, up to and not including the binders
+list, which is its last `bindersLength` bytes since pre_shared_key comes last. -/
+def truncatedClientHello (encoded : ByteArray) (bindersLength : Nat) : ByteArray :=
+  encoded.extract 0 (encoded.size - bindersLength)
+
+/-- A ClientHello offering one PSK, with the placeholder binder, the last 32
+bytes, replaced by `binder`. Lengths are unchanged. -/
+def withPskBinder (hello : Message) (binder : ByteArray) : Message :=
+  { hello with
+    body := hello.body.extract 0 (hello.body.size - 32) ++ binder
+    encoded := hello.encoded.extract 0 (hello.encoded.size - 32) ++ binder }
+
 /-- Validate an optional first-flight P-256 share. Split out (like the two
 optional-extension helpers below) so the `encodeClientHello` do-chain stays
 linear, which lets `encodeClientHello_frame` peel it one bind at a time. -/
@@ -571,6 +622,8 @@ def encodeClientHello (cfg : ClientHelloConfig) : Except String Message := do
   extensions := extensions ++ (← serverNameExtensionBytes cfg.serverName)
   extensions := extensions ++ (← alpnExtensionBytes cfg.alpnProtocols)
   extensions := extensions ++ (← cookieExtensionBytes cfg.cookie)
+  extensions := extensions ++ (← pskModesExtensionBytes cfg.pskOffer.isSome)
+  extensions := extensions ++ (← preSharedKeyExtensionBytes cfg.pskOffer)
 
   let mut body := appendUInt16 ByteArray.empty legacyTls12Version
   body := body ++ cfg.random
@@ -1676,6 +1729,105 @@ def encodeServerHello (random legacySessionIdEcho : ByteArray)
   body := body ++ (← encodeVector16 extensions)
   frame serverHelloType body
 
+/-- A ServerHello accepting a PSK (RFC 9846 §4.2.11): `encodeServerHello`'s
+two extensions, then pre_shared_key carrying the index of the identity chosen. -/
+def encodeServerHelloPsk (random legacySessionIdEcho : ByteArray)
+    (group : NamedGroup) (keyExchange : ByteArray) (selectedIdentity : Nat)
+    (cipherSuite : UInt16 := tlsChaCha20Poly1305Sha256) : Except String Message := do
+  unless random.size == 32 do
+    throw s!"ServerHello random must be 32 bytes, got {random.size}"
+  if legacySessionIdEcho.size > 32 then
+    throw s!"legacy session id echo exceeds 32 bytes ({legacySessionIdEcho.size})"
+  unless selectedIdentity < 65536 do
+    throw s!"selected PSK identity {selectedIdentity} does not fit a uint16"
+  let supportedVersion ←
+    encodeExtension supportedVersionsExtension (appendUInt16 ByteArray.empty tls13Version)
+  let keyShareData := appendUInt16 ByteArray.empty group.toUInt16 ++ (← encodeVector16 keyExchange)
+  let keyShare ← encodeExtension keyShareExtension keyShareData
+  let psk ← encodeExtension preSharedKeyExtension
+    (appendUInt16 ByteArray.empty (UInt16.ofNat selectedIdentity))
+  let extensions := supportedVersion ++ keyShare ++ psk
+  let mut body := appendUInt16 ByteArray.empty legacyTls12Version
+  body := body ++ random
+  body := body ++ (← encodeVector8 legacySessionIdEcho)
+  body := body ++ appendUInt16 ByteArray.empty cipherSuite
+  body := body ++ (ByteArray.empty.push 0)  -- null compression
+  body := body ++ (← encodeVector16 extensions)
+  frame serverHelloType body
+
+/-- The PSK identity a ServerHello selected, if it carries pre_shared_key. -/
+def ServerHello.selectedPsk? (hello : ServerHello) : Except String (Option Nat) :=
+  match hello.extensions.find? (·.extensionType == preSharedKeyExtension) with
+  | none => .ok none
+  | some extension =>
+    if extension.data.size == 2 then
+      .ok (some ((extension.data.get! 0).toNat * 256 + (extension.data.get! 1).toNat))
+    else
+      .error "ServerHello pre_shared_key must be a uint16 identity index"
+
+/-- The PSKs a ClientHello offers (RFC 9846 §4.2.11): each identity with its
+obfuscated age, each binder, and the size of the binders list, length prefix
+included, which `truncatedClientHello` removes. -/
+structure OfferedPsks where
+  identities : Array (ByteArray × UInt32)
+  binders : Array ByteArray
+  bindersLength : Nat
+  deriving Inhabited
+
+/-- Parse the ClientHello's pre_shared_key offer, which must be its last
+extension, with at least one identity and exactly one binder of at least 32
+bytes per identity. -/
+def ClientHello.offeredPsks (hello : ClientHello) : Except String (Option OfferedPsks) := do
+  let some extension := hello.extensions.find?
+      (·.extensionType == preSharedKeyExtension)
+    | pure none
+  unless (hello.extensions.back?.map (·.extensionType)) == some preSharedKeyExtension do
+    throw "pre_shared_key must be the last ClientHello extension"
+  let r : Reader := { bytes := extension.data }
+  let (identitiesBytes, r) ← r.readVector16
+  let (bindersBytes, r) ← r.readVector16
+  r.requireEnd "ClientHello pre_shared_key"
+  let mut identities : Array (ByteArray × UInt32) := #[]
+  let mut ir : Reader := { bytes := identitiesBytes }
+  for _ in [0:identitiesBytes.size] do
+    if ir.atEnd then break
+    let (identity, ir') ← ir.readVector16
+    if identity.isEmpty then
+      throw "ClientHello PSK identity must not be empty"
+    let (age, ir') ← ir'.readUInt32
+    identities := identities.push (identity, age)
+    ir := ir'
+  unless ir.atEnd do
+    throw "ClientHello PSK identities are malformed"
+  if identities.isEmpty then
+    throw "ClientHello PSK identities must not be empty"
+  let mut binders : Array ByteArray := #[]
+  let mut br : Reader := { bytes := bindersBytes }
+  for _ in [0:bindersBytes.size] do
+    if br.atEnd then break
+    let (binder, br') ← br.readVector8
+    if binder.size < 32 then
+      throw s!"ClientHello PSK binder is too short ({binder.size} bytes)"
+    binders := binders.push binder
+    br := br'
+  unless br.atEnd do
+    throw "ClientHello PSK binders are malformed"
+  unless binders.size == identities.size do
+    throw "ClientHello PSK identity and binder counts differ"
+  pure (some { identities, binders, bindersLength := bindersBytes.size + 2 })
+
+/-- The PSK key exchange modes a ClientHello offers, if it has the extension. -/
+def ClientHello.pskModes (hello : ClientHello) : Except String (Option ByteArray) := do
+  let some extension := hello.extensions.find?
+      (·.extensionType == pskKeyExchangeModesExtension)
+    | pure none
+  let r : Reader := { bytes := extension.data }
+  let (modes, r) ← r.readVector8
+  r.requireEnd "psk_key_exchange_modes"
+  if modes.isEmpty then
+    throw "psk_key_exchange_modes must not be empty"
+  pure (some modes)
+
 /-- Build an RFC 8446 HelloRetryRequest selecting TLS 1.3, a cipher suite, and
 the group for which the client must provide a fresh key share. -/
 def encodeHelloRetryRequest (legacySessionIdEcho : ByteArray)
@@ -2161,6 +2313,8 @@ private theorem encodeClientHello_frame {cfg : ClientHelloConfig}
       · obtain ⟨_, hu, _⟩ := bind_ok_ex h
         cases hu
       · obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
         obtain ⟨_, _, h⟩ := bind_ok_ex h
         obtain ⟨_, _, h⟩ := bind_ok_ex h
         obtain ⟨_, _, h⟩ := bind_ok_ex h

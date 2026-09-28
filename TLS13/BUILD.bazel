@@ -69,6 +69,8 @@ lean_assurance_test(
         "TLS13.KeySchedule.derived_spec",
         "TLS13.KeySchedule.Spec.exporter_rfc9846",
         "TLS13.KeySchedule.exporter_spec",
+        "TLS13.KeySchedule.ticketPsk_spec",
+        "TLS13.KeySchedule.binderKey_spec",
         # DER: what the decoder accepted, byte for byte.
         "TLS13.X509.DER.decode_encoded",
         "TLS13.X509.DER.decode_inj",

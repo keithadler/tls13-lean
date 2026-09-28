@@ -1,5 +1,6 @@
 module
 
+public import HaclStar.Aead
 public import HaclStar.Curve25519
 public import HaclStar.Hmac
 public import HaclStar.P256
@@ -92,6 +93,16 @@ structure Config where
   one the client also offers is selected. Empty disables ALPN. -/
   alpnProtocols : List String := []
   clientAuth : Option ClientAuthPolicy := none
+  /-- A 32-byte key that seals this server's session tickets. With it,
+  `issueTicket` sends NewSessionTickets once connected, and a ClientHello that
+  offers such a ticket resumes (RFC 9846 §2.2, psk_dhe_ke only). Rotating it
+  retires every ticket sealed under the old one. -/
+  ticketKey : Option ByteArray := none
+  /-- Ticket lifetime in seconds, at most 604800 (seven days). -/
+  ticketLifetime : UInt32 := 7200
+  /-- The current time, in milliseconds since the Unix epoch, for stamping new
+  tickets and checking an offered ticket's lifetime. The engine reads no clock. -/
+  nowMs : Nat := 0
   deriving Inhabited
 
 inductive Phase where
@@ -140,6 +151,7 @@ inductive Error where
   | notConnected (phase : Phase)
   | connectionClosed
   | keyUpdateLimit
+  | pskBinderMismatch
   | invalidExporterRequest (message : String)
   | internalState (message : String)
   deriving Repr, Inhabited
@@ -183,6 +195,7 @@ def render : Error → String
   | .notConnected phase => s!"TLS connection not ready for application data (waiting for {phase.render})"
   | .connectionClosed => "TLS connection is closed"
   | .keyUpdateLimit => "TLS KeyUpdate limit of 2^48-1 sending epochs reached"
+  | .pskBinderMismatch => "TLS PSK binder verification failed"
   | .invalidExporterRequest message => s!"TLS exporter: {message}"
   | .internalState message => s!"invalid internal TLS server state: {message}"
 
@@ -198,6 +211,7 @@ def fatalAlertDescription? : Error → Option UInt8
   | .invalidAlertLength 0 => some 10
   | .invalidAlertLength _ => some 50
   | .clientFinishedMismatch => some 51      -- decrypt_error
+  | .pskBinderMismatch => some 51           -- decrypt_error
   | .missingRequiredExtension _ => some 109 -- missing_extension
   | .noSupportedCipherSuite => some 40      -- handshake_failure
   | .noSupportedGroup => some 40            -- handshake_failure
@@ -253,6 +267,18 @@ structure State where
   writeKeys? : Option Record.TrafficKeys := none
   clientApplicationKeys? : Option Record.TrafficKeys := none
   expectedClientFinished? : Option ByteArray := none
+  /-- The master secret, kept from the server flight until the client Finished
+  fixes the transcript that `resumption_master_secret` binds. -/
+  masterSecret? : Option ByteArray := none
+  /-- RFC 9846 §7.1 `resumption_master_secret`, once connected. -/
+  resumptionMasterSecret? : Option ByteArray := none
+  ticketKey : Option ByteArray := none
+  ticketLifetime : UInt32 := 7200
+  nowMs : Nat := 0
+  /-- NewSessionTickets sent so far; the next one's ticket_nonce. -/
+  ticketsIssued : Nat := 0
+  /-- This connection resumed a session with a PSK. -/
+  resumed : Bool := false
   /-- RFC 9846 §7.1 `exporter_master_secret`, derived with the server flight and
   served by `exportKeyingMaterial` once the client Finished verifies. -/
   exporterMasterSecret? : Option ByteArray := none
@@ -393,6 +419,9 @@ def start (config : Config) : State :=
     signingAlgorithm := config.signingAlgorithm
     alpnProtocols := config.alpnProtocols
     clientAuth := config.clientAuth
+    ticketKey := config.ticketKey
+    ticketLifetime := config.ticketLifetime
+    nowMs := config.nowMs
   }
 
 private def clientShare? (hello : Handshake.ClientHello) (group : Handshake.NamedGroup) :
@@ -623,6 +652,11 @@ private def checkConfig (state : State) : Except Error Unit := do
         | .p256 point => HaclStar.P256.publicKey state.signingKey == some point
         | _ => false) do
       throw (.invalidConfig "P-256 signing key does not match the leaf certificate")
+  if let some key := state.ticketKey then
+    unless key.size == 32 do
+      throw (.invalidConfig s!"ticket key must be 32 bytes, got {key.size}")
+  if state.ticketLifetime > 604800 then
+    throw (.invalidConfig "ticket lifetime exceeds seven days")
 
 /-- The server CertificateVerify signature, or empty if signing failed: a
 64-byte Ed25519 signature, or a DER ECDSA-Sig-Value with an RFC 6979 nonce. -/
@@ -735,7 +769,7 @@ def completeClientHello (state : State) (hello : Handshake.ClientHello)
     state with
     phase := .waitingClientFinished
     handshakeBuffered := ByteArray.empty
-    transcript := if state.clientAuth.isSome then transcript else ByteArray.empty
+    transcript
     x25519Private := ByteArray.empty
     p256Private := none
     signingKey := ByteArray.empty
@@ -746,6 +780,7 @@ def completeClientHello (state : State) (hello : Handshake.ClientHello)
     clientApplicationKeys? := some clientApplicationKeys
     expectedClientFinished? := some expectedClientFinished
     exporterMasterSecret? := some exporterMasterSecret
+    masterSecret? := some masterSecret
     clientHandshakeSecret? := if state.clientAuth.isSome then some clientHandshakeSecret else none
     alpnSelected := alpnSelected
     peerServerName := hello.serverName
@@ -755,6 +790,174 @@ def completeClientHello (state : State) (hello : Handshake.ClientHello)
     retryHello? := none
     compatibilityCcsSent := state.compatibilityCcsSent || sendCompatibilityCcs
   }, wireBytes)
+
+/-! ## Session tickets and resumption (RFC 9846 §2.2, §4.2.11, §4.6.1)
+
+A ticket is this server's own sealed record of the session: ChaCha20-Poly1305
+under `ticketKey`, with a fresh 12-byte nonce in front, over the PSK, the
+ticket_age_add, the issue time and the lifetime. Nothing is stored server side,
+and a ticket this server did not seal fails authentication and is ignored. -/
+
+private def beBytes (n width : Nat) : ByteArray :=
+  ByteArray.mk ((List.range width).map fun i => UInt8.ofNat (n >>> (8 * (width - 1 - i)))).toArray
+
+private def beNat (bytes : ByteArray) : Nat :=
+  bytes.foldl (fun acc b => acc * 256 + b.toNat) 0
+
+private def ticketAad : ByteArray := "tls13-lean ticket v1".toUTF8
+
+/-- What a sealed ticket carries. -/
+structure TicketContents where
+  psk : ByteArray
+  ageAdd : UInt32
+  issuedMs : Nat
+  lifetime : UInt32
+
+private def sealTicket (key sealNonce : ByteArray) (contents : TicketContents) : ByteArray :=
+  let plaintext := ByteArray.mk #[1] ++ contents.psk ++ beBytes contents.ageAdd.toNat 4 ++
+    beBytes contents.issuedMs 8 ++ beBytes contents.lifetime.toNat 4
+  sealNonce ++ HaclStar.ChaCha20Poly1305.encrypt key sealNonce ticketAad plaintext
+
+/-- Open a ticket this server sealed, or `none`. -/
+def openTicket (key identity : ByteArray) : Option TicketContents :=
+  if identity.size != 12 + 49 + 16 then none
+  else
+    match HaclStar.ChaCha20Poly1305.decrypt key (identity.extract 0 12) ticketAad
+        (identity.extract 12 identity.size) with
+    | none => none
+    | some plain =>
+      if plain.size == 49 && plain.get! 0 == 1 then
+        some { psk := plain.extract 1 33
+               ageAdd := UInt32.ofNat (beNat (plain.extract 33 37))
+               issuedMs := beNat (plain.extract 37 45)
+               lifetime := UInt32.ofNat (beNat (plain.extract 45 49)) }
+      else none
+
+/-- A ticket is live from its issue time for its lifetime. -/
+private def ticketLive (state : State) (ticket : TicketContents) : Bool :=
+  ticket.issuedMs ≤ state.nowMs && state.nowMs - ticket.issuedMs ≤ ticket.lifetime.toNat * 1000
+
+/-- The PSK to resume with, as `(identity index, PSK)`: the first offered
+ticket this server sealed that is still live. Its binder, the HMAC under the
+`res binder` key over the transcript before this ClientHello and the
+ClientHello truncated before its binders, must verify, or the handshake fails
+with decrypt_error. `none` means a full handshake: no ticket key, a ClientHello
+that offers no PSK or not psk_dhe_ke, client authentication required (a ticket
+does not record a client identity), or no ticket that opens. -/
+def choosePsk (state : State) (hello : Handshake.ClientHello)
+    (beforeHello : ByteArray) : Except Error (Option (Nat × ByteArray)) := do
+  let offered ← liftHandshake hello.offeredPsks
+  let some offered := offered | pure none
+  let modes ← liftHandshake hello.pskModes
+  let some modes := modes
+    | throw (.missingRequiredExtension Handshake.pskKeyExchangeModesExtension)
+  let some key := state.ticketKey | pure none
+  if state.clientAuth.isSome || !modes.toList.contains Handshake.pskDheKe then
+    return none
+  let candidates := (List.range offered.identities.size).filterMap fun i =>
+    (openTicket key offered.identities[i]!.1).bind fun ticket =>
+      if ticketLive state ticket then some (i, ticket) else none
+  let some (index, ticket) := candidates.head? | pure none
+  let binderKey := TLS13.KeySchedule.binderKey (TLS13.KeySchedule.earlySecret ticket.psk)
+    emptyTranscriptHash
+  let truncated := Handshake.truncatedClientHello hello.encoded offered.bindersLength
+  let expected := finishedVerifyData binderKey (HaclStar.sha256 (beforeHello ++ truncated))
+  unless constantTimeEq expected offered.binders[index]! do
+    throw .pskBinderMismatch
+  pure (some (index, ticket.psk))
+
+/-- The resumed handshake (RFC 9846 §2.2): `completeClientHello` with the Early
+Secret keyed by the ticket's PSK, pre_shared_key in the ServerHello, and no
+CertificateRequest, Certificate or CertificateVerify, since the PSK
+authenticates the server. The (EC)DHE exchange still runs (psk_dhe_ke). -/
+def completePskClientHello (state : State) (hello : Handshake.ClientHello)
+    (group : Handshake.NamedGroup) (transcriptPrefix : ByteArray)
+    (selectedIdentity : Nat) (psk : ByteArray) :
+    Except Error (State × ByteArray) := do
+  let (serverPublic, sharedSecret) ← keyExchange state hello group
+  unless sharedSecret.size == TLS13.KeySchedule.hashLen do
+    throw (.internalState s!"ECDHE returned a {sharedSecret.size}-byte shared secret")
+  let serverHello ← liftHandshake
+    (Handshake.encodeServerHelloPsk state.serverRandom hello.legacySessionId group
+      serverPublic selectedIdentity)
+  let earlySecret := TLS13.KeySchedule.earlySecret psk
+  let handshakeSecret :=
+    TLS13.KeySchedule.handshakeSecret earlySecret sharedSecret emptyTranscriptHash
+  let transcript := transcriptPrefix ++ serverHello.encoded
+  let serverHelloHash := HaclStar.sha256 transcript
+  let clientHandshakeSecret :=
+    TLS13.KeySchedule.deriveSecret handshakeSecret "c hs traffic" serverHelloHash
+  let serverHandshakeSecret :=
+    TLS13.KeySchedule.deriveSecret handshakeSecret "s hs traffic" serverHelloHash
+  let serverWriteKeys ← liftRecord (Record.deriveTrafficKeys serverHandshakeSecret)
+  let clientReadKeys ← liftRecord (Record.deriveTrafficKeys clientHandshakeSecret)
+  let alpnSelected := selectAlpn state.alpnProtocols hello.alpnProtocols
+  let encryptedExtensions ← liftHandshake (Handshake.encodeEncryptedExtensions alpnSelected)
+  let transcript := transcript ++ encryptedExtensions.encoded
+  let serverVerifyData := finishedVerifyData serverHandshakeSecret (HaclStar.sha256 transcript)
+  let serverFinished ← liftHandshake (Handshake.encodeFinished serverVerifyData)
+  let transcript := transcript ++ serverFinished.encoded
+  let finishedHash := HaclStar.sha256 transcript
+  let expectedClientFinished := finishedVerifyData clientHandshakeSecret finishedHash
+  let masterSecret := TLS13.KeySchedule.masterSecret handshakeSecret emptyTranscriptHash
+  let serverApplicationSecret :=
+    TLS13.KeySchedule.deriveSecret masterSecret "s ap traffic" finishedHash
+  let clientApplicationSecret :=
+    TLS13.KeySchedule.deriveSecret masterSecret "c ap traffic" finishedHash
+  let exporterMasterSecret :=
+    TLS13.KeySchedule.deriveSecret masterSecret "exp master" finishedHash
+  let serverApplicationKeys ← liftRecord (Record.deriveTrafficKeys serverApplicationSecret)
+  let clientApplicationKeys ← liftRecord (Record.deriveTrafficKeys clientApplicationSecret)
+  let flight := encryptedExtensions.encoded ++ serverFinished.encoded
+  let (_, sealedFlight) ←
+    sealHandshakeFlight serverWriteKeys flight 0 ByteArray.empty
+  let serverHelloWire ← liftRecord (Record.encodePlaintext .handshake serverHello.encoded)
+  let sendCompatibilityCcs :=
+    !hello.legacySessionId.isEmpty && !state.compatibilityCcsSent
+  let ccsWire ←
+    if !sendCompatibilityCcs then
+      pure ByteArray.empty
+    else
+      liftRecord (Record.encodePlaintext .changeCipherSpec (ByteArray.empty.push 1))
+  let wireBytes := serverHelloWire ++ ccsWire ++ sealedFlight
+  pure ({
+    state with
+    phase := .waitingClientFinished
+    handshakeBuffered := ByteArray.empty
+    transcript
+    x25519Private := ByteArray.empty
+    p256Private := none
+    signingKey := ByteArray.empty
+    certificateChain := #[]
+    readKeys? := some clientReadKeys
+    writeKeys? := some serverApplicationKeys
+    sendingKeyUpdates := 0
+    clientApplicationKeys? := some clientApplicationKeys
+    expectedClientFinished? := some expectedClientFinished
+    exporterMasterSecret? := some exporterMasterSecret
+    masterSecret? := some masterSecret
+    clientHandshakeSecret? := none
+    alpnSelected := alpnSelected
+    peerServerName := hello.serverName
+    cipherSuiteSelected := some Handshake.tlsChaCha20Poly1305Sha256
+    groupSelected := some group
+    retryGroup? := none
+    retryHello? := none
+    compatibilityCcsSent := state.compatibilityCcsSent || sendCompatibilityCcs
+    resumed := true
+  }, wireBytes)
+
+/-- Resume when the ClientHello offers a ticket this server accepts
+(`choosePsk`), else run the full handshake. `beforeHello` is the transcript
+before this ClientHello (empty, or message_hash and the HelloRetryRequest), and
+`transcriptPrefix` the transcript through it. -/
+private def completeHello (state : State) (hello : Handshake.ClientHello)
+    (group : Handshake.NamedGroup) (beforeHello transcriptPrefix : ByteArray) :
+    Except Error (State × ByteArray) := do
+  match ← choosePsk state hello beforeHello with
+  | none => completeClientHello state hello group transcriptPrefix
+  | some (index, psk) =>
+    completePskClientHello state hello group transcriptPrefix index psk
 
 /-- Emit one RFC 8446 HelloRetryRequest and replace CH1 in the transcript with
 its synthetic message_hash. No handshake keys exist at this point. -/
@@ -795,7 +998,7 @@ private def acceptClientHello (state : State) (message : Handshake.Message) :
   | .waitingClientHello =>
       let group ← selectGroup state hello
       if (clientShare? hello group).isSome then
-        completeClientHello state hello group message.encoded
+        completeHello state hello group ByteArray.empty message.encoded
       else
         sendHelloRetryRequest state message hello group
   | .waitingSecondClientHello =>
@@ -804,7 +1007,7 @@ private def acceptClientHello (state : State) (message : Handshake.Message) :
       let some first := state.retryHello?
         | throw (.internalState "retry phase has no first ClientHello")
       checkRetryClientHello first hello group
-      completeClientHello state hello group (state.transcript ++ message.encoded)
+      completeHello state hello group state.transcript (state.transcript ++ message.encoded)
   | phase =>
       throw (.internalState s!"acceptClientHello called while waiting for {phase.render}")
 
@@ -829,6 +1032,11 @@ def acceptClientFinished (state : State) (message : Handshake.Message) :
     expectedClientFinished? := none
     clientHandshakeSecret? := none
     clientAuth := none
+    -- RFC 9846 §7.1: resumption_master_secret binds ClientHello…client Finished.
+    resumptionMasterSecret? := state.masterSecret?.map fun master =>
+      TLS13.KeySchedule.deriveSecret master "res master"
+        (HaclStar.sha256 (state.transcript ++ message.encoded))
+    masterSecret? := none
     transcript := ByteArray.empty
     pendingClientCertificates := #[]
   }
@@ -1008,6 +1216,43 @@ def updateKeys (state : State) (requestPeer : Bool := false) : Except Error Outp
   let (state, wireBytes) ←
     sendKeyUpdate state (if requestPeer then .updateRequested else .updateNotRequested)
   pure { state, wireBytes }
+
+/-- Send a NewSessionTicket (RFC 9846 §4.6.1) on an established connection,
+under the current write epoch. The ticket carries
+`HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, 32)`
+sealed under `ticketKey`; the ticket_nonce counts this connection's tickets, so
+each carries its own PSK. `ageAdd` and the 12-byte `sealNonce` must be fresh
+random values for every ticket, which the caller supplies because the engine
+draws no entropy. -/
+def issueTicket (state : State) (ageAdd : UInt32) (sealNonce : ByteArray) :
+    Except Error Output := do
+  unless state.phase == .connected do
+    throw (.notConnected state.phase)
+  if state.localClosed then
+    throw .connectionClosed
+  let some key := state.ticketKey
+    | throw (.invalidConfig "no ticket key is configured")
+  let some resumptionMaster := state.resumptionMasterSecret?
+    | throw (.internalState "missing resumption master secret")
+  unless sealNonce.size == 12 do
+    throw (.invalidConfig s!"ticket seal nonce must be 12 bytes, got {sealNonce.size}")
+  let ticketNonce := beBytes state.ticketsIssued 8
+  let ticket := sealTicket key sealNonce {
+    psk := TLS13.KeySchedule.ticketPsk resumptionMaster ticketNonce
+    ageAdd
+    issuedMs := state.nowMs
+    lifetime := state.ticketLifetime
+  }
+  let message ← liftHandshake
+    (Handshake.encodeNewSessionTicket state.ticketLifetime ageAdd ticketNonce ticket)
+  let writeKeys ← requireWriteKeys state
+  let (writeKeys, wireBytes) ←
+    liftRecord (Record.«seal» writeKeys .handshake message.encoded)
+  pure {
+    state := { state with writeKeys? := some writeKeys, ticketsIssued := state.ticketsIssued + 1 }
+    wireBytes
+  }
+
 
 
 private def invalidKeyUpdateRequest (message : Handshake.Message) : Bool :=
@@ -1363,6 +1608,8 @@ inductive Op where
   | fatalAlert (description : UInt8)
   /-- Send a KeyUpdate, asking the peer for one too when `requestPeer`. -/
   | keyUpdate (requestPeer : Bool)
+  /-- Send a NewSessionTicket with a fresh ticket_age_add and seal nonce. -/
+  | issueTicket (ageAdd : UInt32) (sealNonce : ByteArray)
   deriving Inhabited
 
 def step (state : State) (op : Op) : Except Error Output :=
@@ -1372,6 +1619,7 @@ def step (state : State) (op : Op) : Except Error Output :=
   | .close => closeNotify state
   | .fatalAlert description => sealFatalAlert state description
   | .keyUpdate requestPeer => updateKeys state requestPeer
+  | .issueTicket ageAdd sealNonce => issueTicket state ageAdd sealNonce
 
 /-- Drive a sequence of operations from `state`, concatenating produced wire
 bytes and plaintext in order. -/

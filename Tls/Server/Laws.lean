@@ -373,6 +373,49 @@ private theorem completeClientHello_write {state next : State}
     cases h
     exact hgoal
 
+private theorem completePskClientHello_write {state next : State}
+    {hello : Handshake.ClientHello} {group : Handshake.NamedGroup}
+    {transcriptPrefix wire : ByteArray}
+    {selectedIdentity : Nat} {psk : ByteArray}
+    (h : completePskClientHello state hello group transcriptPrefix selectedIdentity psk =
+      .ok (next, wire)) :
+    WriteEffect state next := by
+  unfold completePskClientHello at h
+  simp only [pure_bind] at h
+  obtain ⟨exchanged, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverPublic, sharedSecret⟩ := exchanged
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨serverHello, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverWriteKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientReadKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨encryptedExtensions, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverFinished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightSealed, hflight, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightKeys, sealedFlight⟩ := flightSealed
+  obtain ⟨serverHelloWire, _, h⟩ := except_bind_ok_inv h
+  have hgoal : Record.Extends state.writeKeys? (some serverApplicationKeys) :=
+    Record.Extends.trans (extends_fresh state.writeKeys? serverWriteKeys)
+      (Record.Extends.trans (sealHandshakeFlight_write hflight)
+        (Record.Extends.rekey flightKeys serverApplicationKeys))
+  split at h
+  · cases h; exact hgoal
+  · obtain ⟨ccsWire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    exact hgoal
+
+private theorem completeHello_write {state next : State}
+    {hello : Handshake.ClientHello} {group : Handshake.NamedGroup}
+    {beforeHello transcriptPrefix wire : ByteArray}
+    (h : completeHello state hello group beforeHello transcriptPrefix = .ok (next, wire)) :
+    WriteEffect state next := by
+  unfold completeHello at h
+  obtain ⟨choice, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · exact completeClientHello_write h
+  · exact completePskClientHello_write h
+
 private theorem sendHelloRetryRequest_write {state next : State}
     {message : Handshake.Message} {hello : Handshake.ClientHello}
     {group : Handshake.NamedGroup} {wire : ByteArray}
@@ -402,7 +445,7 @@ private theorem acceptClientHello_write {state next : State}
     first
       | (obtain ⟨group, _, h⟩ := except_bind_ok_inv h
          split at h
-         · exact completeClientHello_write h
+         · exact completeHello_write h
          · exact sendHelloRetryRequest_write h)
       | (split at h <;>
           first
@@ -411,7 +454,7 @@ private theorem acceptClientHello_write {state next : State}
                 first
                   | cases h
                   | (obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-                     exact completeClientHello_write h)))
+                     exact completeHello_write h)))
       | cases h
 
 private theorem acceptClientFinished_write {state next : State}
@@ -632,6 +675,34 @@ private theorem updateKeys_sends {state : State} {requestPeer : Bool} {out : Out
     exact ⟨⟨_, hs⟩, rfl⟩
   · cases h
 
+/-- `issueTicket` protects exactly one handshake record under the connection's
+current write epoch and returns no plaintext; only the write epoch's sequence
+number and the ticket count change. -/
+private theorem issueTicket_seals {state : State} {ageAdd : UInt32}
+    {sealNonce : ByteArray} {out : Output}
+    (h : issueTicket state ageAdd sealNonce = .ok out) :
+    ∃ keys fragment keys' wire, requireWriteKeys state = .ok keys ∧
+      Record.«seal» keys .handshake fragment = .ok (keys', wire) ∧
+      out.state = { state with writeKeys? := some keys',
+                               ticketsIssued := state.ticketsIssued + 1 } ∧
+      out.plaintext = ByteArray.empty := by
+  unfold issueTicket at h
+  simp only [pure_bind] at h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨_, h⟩ := if_throw_ok h
+  split at h
+  · split at h
+    · split at h
+      · obtain ⟨message, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+        obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+        obtain ⟨keys', wire⟩ := sealed
+        cases h
+        exact ⟨keys, _, keys', wire, hk, liftRecord_ok hs, rfl, rfl⟩
+      · cases h
+    · cases h
+  · cases h
+
 theorem step_write {state : State} {op : Op} {out : Output}
     (h : step state op = .ok out) : WriteEffect state out.state := by
   unfold step at h
@@ -642,6 +713,11 @@ theorem step_write {state : State} {op : Op} {out : Output}
   · exact sealFatalAlert_write h
   · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
     exact sendKeyUpdate_write hs
+  · obtain ⟨keys, _, keys', _, hk, hs, hst, -⟩ := issueTicket_seals h
+    rw [hst]
+    show Record.Extends state.writeKeys? (some keys')
+    rw [requireWriteKeys_ok hk]
+    exact Record.Extends.of_seal hs
 
 theorem run_write {ops : List Op} : ∀ {state : State} {out : Output},
     run state ops = .ok out → WriteEffect state out.state := by
@@ -924,6 +1000,48 @@ private theorem completeClientHello_wellFormed {state next : State}
     exact ⟨fun hc => (by cases hc), fun _ => rfl,
       fun hp => (by rcases hp with hp | hp <;> cases hp)⟩
 
+private theorem completePskClientHello_wellFormed {state next : State}
+    {hello : Handshake.ClientHello} {group : Handshake.NamedGroup}
+    {transcriptPrefix wire : ByteArray}
+    {selectedIdentity : Nat} {psk : ByteArray}
+    (h : completePskClientHello state hello group transcriptPrefix selectedIdentity psk =
+      .ok (next, wire)) :
+    next.WellFormed := by
+  unfold completePskClientHello at h
+  simp only [pure_bind] at h
+  obtain ⟨exchanged, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverPublic, sharedSecret⟩ := exchanged
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨serverHello, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverWriteKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientReadKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨encryptedExtensions, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverFinished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightSealed, hflight, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightKeys, sealedFlight⟩ := flightSealed
+  obtain ⟨serverHelloWire, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · cases h
+    exact ⟨fun hc => (by cases hc), fun _ => rfl,
+      fun hp => (by rcases hp with hp | hp <;> cases hp)⟩
+  · obtain ⟨ccsWire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    exact ⟨fun hc => (by cases hc), fun _ => rfl,
+      fun hp => (by rcases hp with hp | hp <;> cases hp)⟩
+
+private theorem completeHello_wellFormed {state next : State}
+    {hello : Handshake.ClientHello} {group : Handshake.NamedGroup}
+    {beforeHello transcriptPrefix wire : ByteArray}
+    (h : completeHello state hello group beforeHello transcriptPrefix = .ok (next, wire)) :
+    next.WellFormed := by
+  unfold completeHello at h
+  obtain ⟨choice, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · exact completeClientHello_wellFormed h
+  · exact completePskClientHello_wellFormed h
+
 private theorem sendHelloRetryRequest_wellFormed {state next : State}
     {message : Handshake.Message} {hello : Handshake.ClientHello}
     {group : Handshake.NamedGroup} {wire : ByteArray}
@@ -957,7 +1075,7 @@ private theorem acceptClientHello_wellFormed {state next : State}
     first
       | (obtain ⟨group, _, h⟩ := except_bind_ok_inv h
          split at h
-         · exact completeClientHello_wellFormed h
+         · exact completeHello_wellFormed h
          · exact sendHelloRetryRequest_wellFormed h hkeys)
       | (split at h <;>
           first
@@ -966,7 +1084,7 @@ private theorem acceptClientHello_wellFormed {state next : State}
                 first
                   | cases h
                   | (obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-                     exact completeClientHello_wellFormed h)))
+                     exact completeHello_wellFormed h)))
       | cases h
 
 /-- **The server becomes connected only by verifying the client Finished**
@@ -1185,6 +1303,10 @@ theorem step_wellFormed {state : State} {op : Op} {out : Output}
   · exact sealFatalAlert_wellFormed h hinv
   · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
     exact sendKeyUpdate_wellFormed hs hinv
+  · obtain ⟨keys, _, keys', _, hk, hs, hst, -⟩ := issueTicket_seals h
+    rw [hst]
+    exact wellFormed_transfer hinv rfl (.inl rfl) rfl rfl
+      (.inr ⟨⟨_, rfl⟩, requireWriteKeys_isSome hk⟩)
 
 /-- **The invariant survives a whole run.** -/
 theorem run_wellFormed {ops : List Op} : ∀ {state : State} {out : Output},
@@ -1681,6 +1803,8 @@ theorem step_plaintext_connected {state : State} {op : Op} {out : Output}
   · rw [closeNotify_plaintext h] at hne; cases hne
   · rw [sealFatalAlert_plaintext h] at hne; cases hne
   · rw [(updateKeys_sends h).2] at hne; cases hne
+  · obtain ⟨_, _, _, _, _, _, _, hpl⟩ := issueTicket_seals h
+    rw [hpl] at hne; cases hne
 
 theorem step_connected {state : State} {op : Op} {out : Output}
     (h : step state op = .ok out) (hc : state.phase = .connected) :
@@ -1693,6 +1817,8 @@ theorem step_connected {state : State} {op : Op} {out : Output}
   · rw [sealFatalAlert_phase h]; exact hc
   · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
     rw [sendKeyUpdate_phase hs]; exact hc
+  · obtain ⟨_, _, _, _, _, _, hst, -⟩ := issueTicket_seals h
+    rw [hst]; exact hc
 
 theorem run_connected {ops : List Op} : ∀ {state : State} {out : Output},
     run state ops = .ok out → state.phase = .connected →
@@ -2041,7 +2167,8 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
           some (HaclStar.hmacSha256
             (Spec.finishedKey H (Spec.derived H inp .cHsTraffic))
             (inp.hash .serverFinished)) ∧
-        next.exporterMasterSecret? = some (Spec.derived H inp .expMaster) := by
+        next.exporterMasterSecret? = some (Spec.derived H inp .expMaster) ∧
+        next.masterSecret? = some (Spec.secret H inp .master) := by
   unfold completeClientHello at h
   simp only [pure_bind] at h
   obtain ⟨exchanged, _, h⟩ := except_bind_ok_inv h
@@ -2082,6 +2209,9 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
             encryptedExtensions.encoded ++ requestBytes ++ certificate.encoded ++
             certVerify.encoded ++ serverFinished.encoded)) =
         Spec.derived H inp .expMaster ∧
+      masterSecret (handshakeSecret earlySecret sharedSecret
+          (HaclStar.sha256 ByteArray.empty)) (HaclStar.sha256 ByteArray.empty) =
+        Spec.secret H inp .master ∧
       finishedVerifyData
           (deriveSecret (handshakeSecret earlySecret sharedSecret
             (HaclStar.sha256 ByteArray.empty)) "c hs traffic"
@@ -2097,7 +2227,7 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
     have hms := masterSecret_node_spec hi inp hhs hempty
     have hsap := deriveSecret_node_spec hi inp .sApTraffic hms hfin
     have hcap := deriveSecret_node_spec hi inp .cApTraffic hms hfin
-    refine ⟨?_, ?_, ?_, deriveSecret_node_spec hi inp .expMaster hms hfin, ?_⟩
+    refine ⟨?_, ?_, ?_, deriveSecret_node_spec hi inp .expMaster hms hfin, hms, ?_⟩
     · rw [← hchs]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hcrk)
     · rw [← hsap]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hsak)
     · rw [← hcap]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hcak)
@@ -2108,13 +2238,178 @@ theorem completeClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
         hchs
   refine ⟨sharedSecret, requestBytes, serverHello, encryptedExtensions, certificate, certVerify,
     serverFinished, eq_of_beq hsize, fun inp h1 h2 h3 h4 h5 => ?_⟩
-  obtain ⟨a, b, c, e, d⟩ := hderiv inp h1 h2 h3 h4 h5
+  obtain ⟨a, b, c, e, m, d⟩ := hderiv inp h1 h2 h3 h4 h5
   split at h
   · cases h
-    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d, congrArg some e⟩
+    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d, congrArg some e, congrArg some m⟩
   · obtain ⟨ccsWire, _, h⟩ := except_bind_ok_inv h
     cases h
-    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d, congrArg some e⟩
+    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d, congrArg some e, congrArg some m⟩
+
+/-- **A resumed handshake installs the RFC 9846 §7.1 epochs of the PSK's key
+schedule.** As `completeClientHello_keySchedule`, with the Early Secret keyed by
+the ticket's PSK rather than zeros, and a transcript with no CertificateRequest,
+Certificate or CertificateVerify, since the PSK authenticates the server. -/
+theorem completePskClientHello_keySchedule {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {hello : Handshake.ClientHello}
+    {group : Handshake.NamedGroup} {transcriptPrefix wire : ByteArray}
+    {selectedIdentity : Nat} {psk : ByteArray}
+    (h : completePskClientHello state hello group transcriptPrefix selectedIdentity psk =
+      .ok (next, wire)) :
+    ∃ (ecdhe : ByteArray) (serverHello encryptedExtensions serverFinished : Handshake.Message),
+      ecdhe.size = hashLen ∧
+      ∀ inp : Spec.Inputs,
+        inp.psk = psk →
+        inp.ecdhe = ecdhe →
+        inp.hash .empty = HaclStar.sha256 ByteArray.empty →
+        inp.hash .serverHello =
+          HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded) →
+        inp.hash .serverFinished =
+          HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
+            encryptedExtensions.encoded ++ serverFinished.encoded) →
+        (∃ rk, next.readKeys? = some rk ∧
+          Record.TrafficKeys.DerivedFrom H rk (Spec.derived H inp .cHsTraffic)) ∧
+        (∃ wk, next.writeKeys? = some wk ∧
+          Record.TrafficKeys.DerivedFrom H wk (Spec.derived H inp .sApTraffic)) ∧
+        (∃ ck, next.clientApplicationKeys? = some ck ∧
+          Record.TrafficKeys.DerivedFrom H ck (Spec.derived H inp .cApTraffic)) ∧
+        next.expectedClientFinished? =
+          some (HaclStar.hmacSha256
+            (Spec.finishedKey H (Spec.derived H inp .cHsTraffic))
+            (inp.hash .serverFinished)) ∧
+        next.exporterMasterSecret? = some (Spec.derived H inp .expMaster) ∧
+        next.masterSecret? = some (Spec.secret H inp .master) := by
+  unfold completePskClientHello at h
+  simp only [pure_bind] at h
+  obtain ⟨exchanged, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverPublic, sharedSecret⟩ := exchanged
+  obtain ⟨hsize, h⟩ := unless_ok h
+  obtain ⟨serverHello, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverWriteKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientReadKeys, hcrk, h⟩ := except_bind_ok_inv h
+  obtain ⟨encryptedExtensions, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverFinished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverApplicationKeys, hsak, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientApplicationKeys, hcak, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightSealed, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightKeys, sealedFlight⟩ := flightSealed
+  obtain ⟨serverHelloWire, _, h⟩ := except_bind_ok_inv h
+  have hderiv : ∀ inp : Spec.Inputs,
+      inp.psk = psk → inp.ecdhe = sharedSecret →
+      inp.hash .empty = HaclStar.sha256 ByteArray.empty →
+      inp.hash .serverHello = HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded) →
+      inp.hash .serverFinished =
+        HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
+          encryptedExtensions.encoded ++ serverFinished.encoded) →
+      Record.TrafficKeys.DerivedFrom H clientReadKeys (Spec.derived H inp .cHsTraffic) ∧
+      Record.TrafficKeys.DerivedFrom H serverApplicationKeys
+        (Spec.derived H inp .sApTraffic) ∧
+      Record.TrafficKeys.DerivedFrom H clientApplicationKeys
+        (Spec.derived H inp .cApTraffic) ∧
+      deriveSecret (masterSecret (handshakeSecret (earlySecret psk) sharedSecret
+          (HaclStar.sha256 ByteArray.empty)) (HaclStar.sha256 ByteArray.empty)) "exp master"
+          (HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
+            encryptedExtensions.encoded ++ serverFinished.encoded)) =
+        Spec.derived H inp .expMaster ∧
+      masterSecret (handshakeSecret (earlySecret psk) sharedSecret
+          (HaclStar.sha256 ByteArray.empty)) (HaclStar.sha256 ByteArray.empty) =
+        Spec.secret H inp .master ∧
+      finishedVerifyData
+          (deriveSecret (handshakeSecret (earlySecret psk) sharedSecret
+            (HaclStar.sha256 ByteArray.empty)) "c hs traffic"
+            (HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded)))
+          (HaclStar.sha256 (transcriptPrefix ++ serverHello.encoded ++
+            encryptedExtensions.encoded ++ serverFinished.encoded)) =
+        HaclStar.hmacSha256 (Spec.finishedKey H (Spec.derived H inp .cHsTraffic))
+          (inp.hash .serverFinished) := by
+    intro inp hpsk hecdhe hempty hsh hfin
+    have hhs := handshakeSecret_psk_node_spec hi inp hpsk hecdhe hempty
+    have hchs := deriveSecret_node_spec hi inp .cHsTraffic hhs hsh
+    have hms := masterSecret_node_spec hi inp hhs hempty
+    have hsap := deriveSecret_node_spec hi inp .sApTraffic hms hfin
+    have hcap := deriveSecret_node_spec hi inp .cApTraffic hms hfin
+    refine ⟨?_, ?_, ?_, deriveSecret_node_spec hi inp .expMaster hms hfin, hms, ?_⟩
+    · rw [← hchs]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hcrk)
+    · rw [← hsap]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hsak)
+    · rw [← hcap]; exact Record.deriveTrafficKeys_spec hi (liftRecord_ok hcak)
+    · refine Eq.trans (finishedVerifyData_spec hi _ _) ?_
+      rw [← hfin]
+      exact congrArg
+        (fun s => HaclStar.hmacSha256 (Spec.finishedKey H s) (inp.hash .serverFinished))
+        hchs
+  refine ⟨sharedSecret, serverHello, encryptedExtensions, serverFinished, eq_of_beq hsize, fun inp h1 h2 h3 h4 h5 => ?_⟩
+  obtain ⟨a, b, c, e, m, d⟩ := hderiv inp h1 h2 h3 h4 h5
+  split at h
+  · cases h
+    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d, congrArg some e, congrArg some m⟩
+  · obtain ⟨ccsWire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    exact ⟨⟨_, rfl, a⟩, ⟨_, rfl, b⟩, ⟨_, rfl, c⟩, congrArg some d, congrArg some e, congrArg some m⟩
+
+/-- **A PSK is accepted only with its binder verified** (RFC 9846 §4.2.11.2):
+the binder offered for the chosen identity matches the HMAC, under the
+finished key of `Derive-Secret(Early Secret(PSK), "res binder", "")`, of the
+transcript before this ClientHello and the ClientHello truncated before its
+binders. With `binderKey_spec` and `finishedVerifyData_spec`, that key is
+§7.1's `binder_key` for the PSK. -/
+theorem choosePsk_binder {state : State} {hello : Handshake.ClientHello}
+    {beforeHello : ByteArray} {index : Nat} {psk : ByteArray}
+    (h : choosePsk state hello beforeHello = .ok (some (index, psk))) :
+    ∃ offered : Handshake.OfferedPsks, hello.offeredPsks = .ok (some offered) ∧
+      constantTimeEq
+        (finishedVerifyData
+          (binderKey (earlySecret psk) (HaclStar.sha256 ByteArray.empty))
+          (HaclStar.sha256 (beforeHello ++
+            Handshake.truncatedClientHello hello.encoded offered.bindersLength)))
+        offered.binders[index]! = true := by
+  unfold choosePsk at h
+  simp only [bind, Except.bind] at h
+  split at h
+  · cases h
+  · rename_i offeredOpt hoff
+    split at h
+    · rename_i offered
+      split at h
+      · cases h
+      · split at h
+        · split at h
+          · split at h
+            · cases h
+            · split at h
+              · cases h
+              · split at h
+                · rename_i i ticket _
+                  split at h
+                  · rename_i hct
+                    split at h
+                    · cases h
+                    · cases h
+                      exact ⟨offered, liftHandshake_ok hoff, hct⟩
+                  · split at h
+                    · cases h
+                    · rename_i hthrow
+                      cases hthrow
+                · cases h
+          · cases h
+        · cases h
+    · cases h
+
+/-- **The server's resumption master secret is §7.1's `res master` node**:
+`Derive-Secret(Master Secret, "res master", ClientHello…client Finished)`,
+given that the master secret it kept is the specification's
+(`completeClientHello_keySchedule`, `completePskClientHello_keySchedule`). -/
+theorem acceptClientFinished_resumptionMaster {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {message : Handshake.Message} (inp : Spec.Inputs)
+    (hmaster : state.masterSecret? = some (Spec.secret H inp .master))
+    (hcf : inp.hash .clientFinished = HaclStar.sha256 (state.transcript ++ message.encoded))
+    (h : acceptClientFinished state message = .ok next) :
+    next.resumptionMasterSecret? = some (Spec.derived H inp .resMaster) := by
+  have hrms := deriveSecret_node_spec hi inp .resMaster rfl hcf
+  unfold acceptClientFinished at h
+  simp only [pure_bind] at h
+  obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
+  repeat' first | (split at h) | (cases h)
+  all_goals (simp only [hmaster, Option.map]; exact congrArg some hrms)
 
 /-- **The exporter is RFC 9846 §7.5's `TLS-Exporter`** over the connection's
 stored exporter master secret, which `completeClientHello_keySchedule` shows is
@@ -2511,6 +2806,75 @@ private theorem completeClientHello_epochs {H : Spec.Hkdf} (hi : Implements H)
     exact hgoal _ _ _ _ _ _ _ _ (liftRecord_ok hswk) (liftRecord_ok hsak)
       (sealHandshakeFlight_epochs hflight) rfl
 
+private theorem completePskClientHello_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {hello : Handshake.ClientHello}
+    {group : Handshake.NamedGroup} {transcriptPrefix wire : ByteArray}
+    {selectedIdentity : Nat} {psk : ByteArray}
+    (h : completePskClientHello state hello group transcriptPrefix selectedIdentity psk =
+      .ok (next, wire))
+    (hnone : state.writeKeys? = none) : SpecEffect H state next := by
+  unfold completePskClientHello at h
+  simp only [pure_bind] at h
+  obtain ⟨exchanged, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverPublic, sharedSecret⟩ := exchanged
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨serverHello, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverWriteKeys, hswk, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientReadKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨encryptedExtensions, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverFinished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨serverApplicationKeys, hsak, h⟩ := except_bind_ok_inv h
+  obtain ⟨clientApplicationKeys, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightSealed, hflight, h⟩ := except_bind_ok_inv h
+  obtain ⟨flightKeys, sealedFlight⟩ := flightSealed
+  obtain ⟨serverHelloWire, _, h⟩ := except_bind_ok_inv h
+  have hgoal : ∀ (p₁ c₁ p₂ c₂ : ByteArray) (swk sak fk : Record.TrafficKeys)
+      (n : State),
+      Record.deriveTrafficKeys
+        (TLS13.KeySchedule.deriveSecret p₁ "s hs traffic" c₁) = .ok swk →
+      Record.deriveTrafficKeys
+        (TLS13.KeySchedule.deriveSecret p₂ "s ap traffic" c₂) = .ok sak →
+      Record.WithinEpoch H (some swk) (some fk) →
+      n.writeKeys? = some sak → SpecEffect H state n := by
+    intro p₁ c₁ p₂ c₂ swk sak fk n hd₁ hd₂ hfl hwk o ho
+    have ho' : o = none := Record.EpochOf.none_inv (by rw [← hnone]; exact ho.1)
+    subst ho'
+    have hswk' : swk.secret = (⟨p₁, .sHsTraffic, c₁, 0⟩ : Spec.Epoch).secret H :=
+      (Record.deriveTrafficKeys_spec hi hd₁).secret_eq.trans
+        (TLS13.KeySchedule.deriveSecret_spec hi p₁ .sHsTraffic c₁)
+    have hstep := hfl.apply (Record.EpochOf.intro hswk')
+    have hlt : (⟨p₁, Spec.Label.sHsTraffic, c₁, 0⟩ : Spec.Epoch).Lt
+        ⟨p₂, Spec.Label.sApTraffic, c₂, 0⟩ :=
+      Or.inl (by exact (by decide : (1 : Nat) < 2))
+    refine ⟨some ⟨p₂, .sApTraffic, c₂, 0⟩, ⟨?_, fun e he => by cases he; rfl⟩, ?_⟩
+    · rw [hwk]
+      exact Record.EpochOf.intro
+        ((Record.deriveTrafficKeys_spec hi hd₂).secret_eq.trans
+          (TLS13.KeySchedule.deriveSecret_spec hi p₂ .sApTraffic c₂))
+    · rw [hnone, hwk]
+      exact Record.SpecExtends.install.trans
+        (hstep.2.trans (Record.SpecExtends.rekey (Record.EpochOf.secret_eq hstep.1)
+          (by intro hc; cases hc) hlt))
+  split at h
+  · cases h
+    exact hgoal _ _ _ _ _ _ _ _ (liftRecord_ok hswk) (liftRecord_ok hsak)
+      (sealHandshakeFlight_epochs hflight) rfl
+  · obtain ⟨ccsWire, _, h⟩ := except_bind_ok_inv h
+    cases h
+    exact hgoal _ _ _ _ _ _ _ _ (liftRecord_ok hswk) (liftRecord_ok hsak)
+      (sealHandshakeFlight_epochs hflight) rfl
+
+private theorem completeHello_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {hello : Handshake.ClientHello}
+    {group : Handshake.NamedGroup} {beforeHello transcriptPrefix wire : ByteArray}
+    (h : completeHello state hello group beforeHello transcriptPrefix = .ok (next, wire))
+    (hnone : state.writeKeys? = none) : SpecEffect H state next := by
+  unfold completeHello at h
+  obtain ⟨choice, _, h⟩ := except_bind_ok_inv h
+  split at h
+  · exact completeClientHello_epochs hi h hnone
+  · exact completePskClientHello_epochs hi h hnone
+
 private theorem sendHelloRetryRequest_epochs {H : Spec.Hkdf} {state next : State}
     {message : Handshake.Message} {hello : Handshake.ClientHello}
     {group : Handshake.NamedGroup} {wire : ByteArray}
@@ -2540,7 +2904,7 @@ private theorem acceptClientHello_epochs {H : Spec.Hkdf} (hi : Implements H)
     first
       | (obtain ⟨group, _, h⟩ := except_bind_ok_inv h
          split at h
-         · exact completeClientHello_epochs hi h hnone
+         · exact completeHello_epochs hi h hnone
          · exact sendHelloRetryRequest_epochs h)
       | (split at h <;>
           first
@@ -2549,7 +2913,7 @@ private theorem acceptClientHello_epochs {H : Spec.Hkdf} (hi : Implements H)
                 first
                   | cases h
                   | (obtain ⟨_, _, h⟩ := except_bind_ok_inv h
-                     exact completeClientHello_epochs hi h hnone)))
+                     exact completeHello_epochs hi h hnone)))
       | cases h
 
 private theorem acceptClientFinished_epochs {H : Spec.Hkdf} {state next : State}
@@ -2730,6 +3094,12 @@ theorem step_epochs {H : Spec.Hkdf} (hi : Implements H) {state : State} {op : Op
   · exact sealFatalAlert_epochs h
   · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
     exact sendKeyUpdate_epochs hi hs
+  · obtain ⟨keys, _, keys', _, hk, hs, hst, -⟩ := issueTicket_seals h
+    rw [hst]
+    refine SpecEffect.within ?_
+    show Record.WithinEpoch H state.writeKeys? (some keys')
+    rw [requireWriteKeys_ok hk]
+    exact Record.WithinEpoch.of_seal hs
 
 /-- **Every epoch a run installs is a strictly later node of the RFC 8446 §7.1 /
 §7.2 key schedule than the one it replaces.** -/
