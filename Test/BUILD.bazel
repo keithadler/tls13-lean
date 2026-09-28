@@ -79,6 +79,15 @@ lean_test(
     deps = ["//Tls:tls"],
 )
 
+# Post-handshake client authentication between the two engines: request,
+# answer, chain and Finished validation, and the refusals.
+lean_test(
+    name = "tls_post_handshake_auth_test",
+    srcs = ["TlsPostHandshakeAuthTest.lean"],
+    data = glob(["Fixtures/Identity/*.pem", "Fixtures/Identity/*.der"]),
+    deps = ["//Tls:tls"],
+)
+
 # The client-side counterpart: drives Tls.Client against an external server.
 lean_binary(
     name = "tls_external_client",

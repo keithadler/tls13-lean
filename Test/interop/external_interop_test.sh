@@ -318,6 +318,25 @@ if run_openssl openssl-mtls \
 fi
 unset TLS13_TEST_CLIENT_CA
 
+# Post-handshake client authentication (RFC 9846 §4.6.2): OpenSSL offers
+# post_handshake_auth; after the handshake the server asks for a certificate,
+# and OpenSSL's answer must validate against the identity root.
+export TLS13_TEST_PHA_CA="${SERVER_CWD}/Test/Fixtures/Identity/root.pem"
+start_server
+timeout 30 openssl s_client -connect "127.0.0.1:${PORT}" -tls1_3 -CAfile "${CERT}" \
+  -servername localhost -verify_return_error -ign_eof -enable_pha \
+  -cert "${SERVER_CWD}/Test/Fixtures/Identity/client.pem" \
+  -key "${SERVER_CWD}/Test/Fixtures/Identity/client-key.pem" \
+  -cert_chain "${TLS13_TEST_PHA_CA}" </dev/null >"${WORK}/openssl-pha.log" 2>&1
+finish_server
+unset TLS13_TEST_PHA_CA
+if grep -q '^POST_HANDSHAKE_AUTH certificates=2' "${SERVER_LOG}"; then
+  note "PASS openssl post-handshake client authentication"
+else
+  dump_case openssl-pha "${WORK}/openssl-pha.log"
+  fail "openssl-pha: no validated post-handshake client certificate"
+fi
+
 # Session resumption (RFC 9846 §2.2) against the Lean server: s_client keeps
 # the harness's NewSessionTicket, then offers it to a fresh server process
 # (tickets are sealed under a fixed test key); the second handshake must be a

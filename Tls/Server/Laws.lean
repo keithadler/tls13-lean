@@ -468,6 +468,19 @@ private theorem acceptClientFinished_write {state next : State}
   all_goals exact Record.Extends.refl _
 
 
+/-- Completing a post-handshake authentication changes only the outstanding
+request, the peer's certificates and the count of such authentications. -/
+private theorem acceptPostHandshakeFinished_frame {state next : State}
+    {message : Handshake.Message}
+    (h : acceptPostHandshakeFinished state message = .ok next) :
+    ∃ (peer : Array TLS13.X509.Certificate) (count : Nat),
+      next = { state with postAuth? := none, peerCertificates := peer, postHandshakeAuthentications := count } := by
+  unfold acceptPostHandshakeFinished at h
+  simp only [pure_bind] at h
+  obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
+  repeat' first | (split at h) | (cases h)
+  all_goals exact ⟨_, _, rfl⟩
+
 private theorem processHandshakeBuffer_write {state next : State} {wire : ByteArray}
     (h : processHandshakeBuffer state = .ok (next, wire)) :
     WriteEffect state next := by
@@ -494,9 +507,15 @@ private theorem processHandshakeBuffer_write {state next : State} {wire : ByteAr
       exact hw
     · split at h
       · obtain ⟨_, h⟩ := unless_ok h
-        exact acceptKeyUpdate_write
-          (state := { state with handshakeBuffered := rest }) h
-      · cases h
+        obtain ⟨stateF, hfin, h⟩ := except_bind_ok_inv h
+        cases h
+        obtain ⟨peer, count, rfl⟩ := acceptPostHandshakeFinished_frame hfin
+        exact Record.Extends.refl _
+      · split at h
+        · obtain ⟨_, h⟩ := unless_ok h
+          exact acceptKeyUpdate_write
+            (state := { state with handshakeBuffered := rest }) h
+        · cases h
 
 private theorem prepareClientFlight_frame {state next : State}
     (h : prepareClientFlight state = .ok next) :
@@ -509,8 +528,16 @@ private theorem prepareClientFlight_frame {state next : State}
     obtain ⟨auth, buffer⟩ := pair
     cases h
     exact ⟨rfl, rfl, rfl, rfl⟩
-  · cases h
-    exact ⟨rfl, rfl, rfl, rfl⟩
+  · split at h
+    · split at h
+      · obtain ⟨pair, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨auth, buffer⟩ := pair
+        cases h
+        exact ⟨rfl, rfl, rfl, rfl⟩
+      · cases h
+        exact ⟨rfl, rfl, rfl, rfl⟩
+    · cases h
+      exact ⟨rfl, rfl, rfl, rfl⟩
 
 private theorem processProtectedRecord_write {state next : State}
     {record : Record.RawRecord} {plain wire : ByteArray}
@@ -703,6 +730,31 @@ private theorem issueTicket_seals {state : State} {ageAdd : UInt32}
     · cases h
   · cases h
 
+/-- `requestClientCertificate` protects exactly one handshake record under the
+current write epoch and returns no plaintext; only that epoch's sequence number
+and the outstanding request change. -/
+private theorem requestClientCertificate_seals {state : State} {context : ByteArray}
+    {out : Output} (h : requestClientCertificate state context = .ok out) :
+    ∃ (keys : Record.TrafficKeys) (fragment : ByteArray) (keys' : Record.TrafficKeys)
+      (wire : ByteArray) (pending : PostAuth), requireWriteKeys state = .ok keys ∧
+      Record.«seal» keys .handshake fragment = .ok (keys', wire) ∧
+      out.state = { state with writeKeys? := some keys', postAuth? := some pending } ∧
+      out.plaintext = ByteArray.empty := by
+  unfold requestClientCertificate at h
+  simp only [pure_bind] at h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨_, h⟩ := if_throw_ok h
+  split at h
+  · split at h
+    · obtain ⟨request, _, h⟩ := except_bind_ok_inv h
+      obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+      obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+      obtain ⟨keys', wire⟩ := sealed
+      cases h
+      exact ⟨keys, _, keys', wire, _, hk, liftRecord_ok hs, rfl, rfl⟩
+    · cases h
+  · cases h
+
 theorem step_write {state : State} {op : Op} {out : Output}
     (h : step state op = .ok out) : WriteEffect state out.state := by
   unfold step at h
@@ -714,6 +766,11 @@ theorem step_write {state : State} {op : Op} {out : Output}
   · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
     exact sendKeyUpdate_write hs
   · obtain ⟨keys, _, keys', _, hk, hs, hst, -⟩ := issueTicket_seals h
+    rw [hst]
+    show Record.Extends state.writeKeys? (some keys')
+    rw [requireWriteKeys_ok hk]
+    exact Record.Extends.of_seal hs
+  · obtain ⟨keys, _, keys', _, _, hk, hs, hst, -⟩ := requestClientCertificate_seals h
     rw [hst]
     show Record.Extends state.writeKeys? (some keys')
     rw [requireWriteKeys_ok hk]
@@ -1149,9 +1206,15 @@ private theorem processHandshakeBuffer_wellFormed {state next : State}
       exact acceptClientFinished_wellFormed hfin (hinv.2.1 (.inl hph))
     · split at h
       · obtain ⟨_, h⟩ := unless_ok h
-        exact acceptKeyUpdate_wellFormed h
-          (wellFormed_transfer hinv rfl (.inl rfl) rfl rfl (.inl rfl))
-      · cases h
+        obtain ⟨stateF, hfin, h⟩ := except_bind_ok_inv h
+        cases h
+        obtain ⟨peer, count, rfl⟩ := acceptPostHandshakeFinished_frame hfin
+        exact hinv
+      · split at h
+        · obtain ⟨_, h⟩ := unless_ok h
+          exact acceptKeyUpdate_wellFormed h
+            (wellFormed_transfer hinv rfl (.inl rfl) rfl rfl (.inl rfl))
+        · cases h
 
 private theorem phase_eq_of_beq {p q : Phase} (h : (p == q) = true) : p = q := by
   cases p <;> cases q <;> first | rfl | exact absurd h (by decide)
@@ -1175,8 +1238,16 @@ private theorem prepareClientFlight_wellFormed {state next : State}
       exact hinv.2.1 (.inl hphase)
     · intro hc
       simp_all
-  · cases h
-    exact hinv
+  · split at h
+    · split at h
+      · obtain ⟨pair, _, h⟩ := except_bind_ok_inv h
+        obtain ⟨auth, buffer⟩ := pair
+        cases h
+        exact hinv
+      · cases h
+        exact hinv
+    · cases h
+      exact hinv
 
 private theorem processProtectedRecord_wellFormed {state next : State}
     {record : Record.RawRecord} {plain wire : ByteArray}
@@ -1304,6 +1375,10 @@ theorem step_wellFormed {state : State} {op : Op} {out : Output}
   · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
     exact sendKeyUpdate_wellFormed hs hinv
   · obtain ⟨keys, _, keys', _, hk, hs, hst, -⟩ := issueTicket_seals h
+    rw [hst]
+    exact wellFormed_transfer hinv rfl (.inl rfl) rfl rfl
+      (.inr ⟨⟨_, rfl⟩, requireWriteKeys_isSome hk⟩)
+  · obtain ⟨keys, _, keys', _, _, hk, hs, hst, -⟩ := requestClientCertificate_seals h
     rw [hst]
     exact wellFormed_transfer hinv rfl (.inl rfl) rfl rfl
       (.inr ⟨⟨_, rfl⟩, requireWriteKeys_isSome hk⟩)
@@ -1476,9 +1551,15 @@ private theorem processHandshakeBuffer_connected {state next : State}
       rw [hc] at hph'; cases hph'
     · split at h
       · obtain ⟨_, h⟩ := unless_ok h
-        rw [acceptKeyUpdate_phase h]
+        obtain ⟨stateF, hfin, h⟩ := except_bind_ok_inv h
+        cases h
+        obtain ⟨peer, count, rfl⟩ := acceptPostHandshakeFinished_frame hfin
         exact hc
-      · cases h
+      · split at h
+        · obtain ⟨_, h⟩ := unless_ok h
+          rw [acceptKeyUpdate_phase h]
+          exact hc
+        · cases h
 
 /-- The delivery point: a protected record hands plaintext up only from the
 `applicationData` branch, which refuses to run unless the phase is
@@ -1805,6 +1886,8 @@ theorem step_plaintext_connected {state : State} {op : Op} {out : Output}
   · rw [(updateKeys_sends h).2] at hne; cases hne
   · obtain ⟨_, _, _, _, _, _, _, hpl⟩ := issueTicket_seals h
     rw [hpl] at hne; cases hne
+  · obtain ⟨_, _, _, _, _, _, _, _, hpl⟩ := requestClientCertificate_seals h
+    rw [hpl] at hne; cases hne
 
 theorem step_connected {state : State} {op : Op} {out : Output}
     (h : step state op = .ok out) (hc : state.phase = .connected) :
@@ -1818,6 +1901,8 @@ theorem step_connected {state : State} {op : Op} {out : Output}
   · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
     rw [sendKeyUpdate_phase hs]; exact hc
   · obtain ⟨_, _, _, _, _, _, hst, -⟩ := issueTicket_seals h
+    rw [hst]; exact hc
+  · obtain ⟨_, _, _, _, _, _, _, hst, -⟩ := requestClientCertificate_seals h
     rw [hst]; exact hc
 
 theorem run_connected {ops : List Op} : ∀ {state : State} {out : Output},
@@ -2411,6 +2496,55 @@ theorem acceptClientFinished_resumptionMaster {H : Spec.Hkdf} (hi : Implements H
   repeat' first | (split at h) | (cases h)
   all_goals (simp only [hmaster, Option.map]; exact congrArg some hrms)
 
+/-- **A post-handshake CertificateRequest goes only to a client that offered
+post_handshake_auth, on an established, open connection with a policy to
+validate the answer, one at a time** (RFC 9846 §4.2.6, §4.6.2). -/
+theorem requestClientCertificate_permitted {state : State} {context : ByteArray}
+    {out : Output} (h : requestClientCertificate state context = .ok out) :
+    state.phase = .connected ∧ state.localClosed = false ∧
+      state.postHandshakeAuth.isSome = true ∧ state.clientOffersPostHandshakeAuth = true ∧
+      state.postAuth?.isNone = true := by
+  unfold requestClientCertificate at h
+  simp only [pure_bind] at h
+  obtain ⟨hp, h⟩ := unless_ok h
+  obtain ⟨hcl, h⟩ := if_throw_ok h
+  split at h
+  · rename_i policy hpol
+    split at h
+    · rename_i hok
+      simp only [Bool.and_eq_true] at hok
+      exact ⟨phase_eq_of_beq hp, by simpa using hcl, by rw [hpol]; rfl, hok.1.1.1, hok.1.1.2⟩
+    · cases h
+  · cases h
+
+/-- **A post-handshake authentication completes only with the client Finished
+it expected, after the certificate step was validated**: the Finished matches
+(constant time) the one computed from the client's current application secret
+over the handshake transcript, the request, and the client's Certificate and
+CertificateVerify, and the certificate was received and verified. -/
+theorem acceptPostHandshakeFinished_verified {state next : State}
+    {message : Handshake.Message}
+    (h : acceptPostHandshakeFinished state message = .ok next) :
+    ∃ (pending : PostAuth) (expected : ByteArray) (finished : Handshake.Finished),
+      state.postAuth? = some pending ∧ pending.expectedFinished? = some expected ∧
+      Handshake.parseFinished message = .ok finished ∧
+      constantTimeEq expected finished.verifyData = true ∧
+      pending.received = true ∧ pending.verified = true := by
+  unfold acceptPostHandshakeFinished at h
+  simp only [pure_bind] at h
+  obtain ⟨finished, hf, h⟩ := except_bind_ok_inv h
+  split at h
+  · rename_i pending hpending
+    split at h
+    · rename_i expected hexp
+      obtain ⟨hct, h⟩ := unless_ok h
+      obtain ⟨hrv, _⟩ := unless_ok h
+      simp only [Bool.and_eq_true] at hrv
+      exact ⟨pending, expected, finished, hpending, hexp, liftHandshake_ok hf, hct,
+        hrv.1, hrv.2⟩
+    · cases h
+  · cases h
+
 /-- **The exporter is RFC 9846 §7.5's `TLS-Exporter`** over the connection's
 stored exporter master secret, which `completeClientHello_keySchedule` shows is
 §7.1's `exporter_master_secret`. -/
@@ -2955,8 +3089,14 @@ private theorem processHandshakeBuffer_epochs {H : Spec.Hkdf} (hi : Implements H
       exact SpecEffect.of_eq hw rfl
     · split at h
       · obtain ⟨_, h⟩ := unless_ok h
-        exact SpecEffect.of_eq (acceptKeyUpdate_epochs hi h) rfl
-      · cases h
+        obtain ⟨stateF, hfin, h⟩ := except_bind_ok_inv h
+        cases h
+        obtain ⟨peer, count, rfl⟩ := acceptPostHandshakeFinished_frame hfin
+        exact SpecEffect.within (Record.WithinEpoch.refl _)
+      · split at h
+        · obtain ⟨_, h⟩ := unless_ok h
+          exact SpecEffect.of_eq (acceptKeyUpdate_epochs hi h) rfl
+        · cases h
 
 private theorem processProtectedRecord_epochs {H : Spec.Hkdf} (hi : Implements H)
     {state next : State} {record : Record.RawRecord} {plain wire : ByteArray}
@@ -3095,6 +3235,12 @@ theorem step_epochs {H : Spec.Hkdf} (hi : Implements H) {state : State} {op : Op
   · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
     exact sendKeyUpdate_epochs hi hs
   · obtain ⟨keys, _, keys', _, hk, hs, hst, -⟩ := issueTicket_seals h
+    rw [hst]
+    refine SpecEffect.within ?_
+    show Record.WithinEpoch H state.writeKeys? (some keys')
+    rw [requireWriteKeys_ok hk]
+    exact Record.WithinEpoch.of_seal hs
+  · obtain ⟨keys, _, keys', _, _, hk, hs, hst, -⟩ := requestClientCertificate_seals h
     rw [hst]
     refine SpecEffect.within ?_
     show Record.WithinEpoch H state.writeKeys? (some keys')

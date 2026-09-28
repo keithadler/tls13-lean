@@ -107,6 +107,22 @@ private def parseArgs (args : List String) : IO (UInt16 × UInt64) := do
     throw (IO.userError "read size must be positive")
   pure (UInt16.ofNat port, UInt64.ofNat readSize)
 
+/-- Feed transport chunks until a post-handshake authentication completes. -/
+private partial def awaitPostHandshakeAuth (client : TCP.Socket.Client) (readSize : UInt64)
+    (state : Server.State) (goal : Nat) : IO Server.State := do
+  if state.postHandshakeAuthentications ≥ goal then
+    pure state
+  else
+    let some chunk ← (client.recv? readSize).block
+      | throw (IO.userError "client closed before answering the CertificateRequest")
+    match Server.feedWithFailure state chunk with
+    | .error failure =>
+        sendFatalAlert client failure
+        throw (IO.userError s!"TLS server: {failure.error}")
+    | .ok output =>
+        sendBytes client output.wireBytes
+        awaitPostHandshakeAuth client readSize output.state goal
+
 /-- One connection: handshake, a session ticket, a KeyUpdate, the page, and
 close_notify, logging what the gate checks. -/
 private def serveOne (client : TCP.Socket.Client) (readSize : UInt64)
@@ -121,6 +137,18 @@ private def serveOne (client : TCP.Socket.Client) (readSize : UInt64)
       ByteArray.empty 32 with
   | .ok material => logLine s!"EXPORTER {HaclStar.Hex.encode material}"
   | .error error => logLine s!"EXPORTER-ERROR {error}"
+  -- RFC 9846 §4.6.2: when configured and offered, ask for a client
+  -- certificate after the handshake and wait for the validated answer.
+  let connected ←
+    if connected.postHandshakeAuth.isSome && connected.clientOffersPostHandshakeAuth then do
+      match Server.requestClientCertificate connected "tls13-lean".toUTF8 with
+      | .error error => throw (IO.userError s!"TLS CertificateRequest: {error}")
+      | .ok output =>
+          sendBytes client output.wireBytes
+          let authenticated ← awaitPostHandshakeAuth client readSize output.state 1
+          logLine s!"POST_HANDSHAKE_AUTH certificates={authenticated.peerCertificates.size}"
+          pure authenticated
+    else pure connected
   if connected.peerClosed then
     logLine "peer closed immediately after the handshake"
   else
@@ -192,6 +220,15 @@ def main (args : List String) : IO Unit := do
               hex "a6eed801fedf29bb85372696aefdceeec792ef1dd4f67dbb5b6fd6476e261fb1"
             signingAlgorithm := .ecdsaP256Sha256 }
       | .error error => throw (IO.userError s!"could not decode ECDSA certificate: {error}")
+  let config ← match ← IO.getEnv "TLS13_TEST_PHA_CA" with
+    | none => pure config
+    | some path => do
+      let pem ← IO.FS.readFile path
+      let trustStore ← match TLS13.X509.Chain.TrustStore.decodePEM pem with
+        | .ok store => pure store
+        | .error error => throw (IO.userError error)
+      let now := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.toInt
+      pure { config with postHandshakeAuth := some { trustStore, now } }
   let config ← match ← IO.getEnv "TLS13_TEST_CLIENT_CA" with
     | none => pure config
     | some path => do

@@ -79,6 +79,9 @@ structure Config where
   resumption : Option Ticket := none
   /-- Milliseconds since `resumption` was received, for its obfuscated age. -/
   ticketAgeMs : Nat := 0
+  /-- Offer post_handshake_auth (RFC 9846 §4.2.6): answer a CertificateRequest
+  after the handshake with `identity`, or with an empty Certificate without one. -/
+  postHandshakeAuth : Bool := false
   deriving Inhabited
 
 /-- Strict server-handshake ordering; CertificateRequest is consumed at the
@@ -247,6 +250,10 @@ structure State where
   resumptionMasterSecret? : Option ByteArray := none
   /-- Tickets the server has sent on this connection, oldest first. -/
   tickets : Array Ticket := #[]
+  /-- ClientHello…client Finished, kept after the handshake when
+  post_handshake_auth was offered: every post-handshake authentication binds
+  it (RFC 9846 §4.4.1). -/
+  handshakeTranscript : ByteArray := ByteArray.empty
   /-- ALPN protocol IDs advertised by this connection's ClientHello. -/
   offeredAlpnProtocols : Array String := #[]
   identity : Option Identity := none
@@ -469,6 +476,7 @@ def start (config : Config) : Except Error Output := do
     legacySessionId := config.legacySessionId
     alpnProtocols := config.alpnProtocols
     offerP256 := p256PublicKey.isSome
+    postHandshakeAuth := config.postHandshakeAuth
     pskOffer := config.resumption.map fun ticket => {
       identity := ticket.identity
       obfuscatedTicketAge :=
@@ -787,7 +795,8 @@ def completeServerHandshake (state : State) (message : Handshake.Message) :
     handshakeSecret? := none
     clientHandshakeTrafficSecret? := none
     serverHandshakeTrafficSecret? := none
-    identity := none
+    -- Kept only to answer a post-handshake CertificateRequest.
+    identity := if state.helloConfig.postHandshakeAuth then state.identity else none
     peerAuth := none
     certificateRequested := false
     clientSignaturePermitted := false
@@ -796,6 +805,9 @@ def completeServerHandshake (state : State) (message : Handshake.Message) :
     exporterMasterSecret? := some exporterMasterSecret
     resumptionMasterSecret? := some resumptionMasterSecret
     offeredPsk? := none
+    handshakeTranscript := if state.helloConfig.postHandshakeAuth then
+        transcriptThroughServerFinished ++ authentication ++ clientFinished.encoded
+      else ByteArray.empty
     sendingKeyUpdates := 0
   }, wireBytes)
 
@@ -895,6 +907,51 @@ def acceptKeyUpdate (state : State) (message : Handshake.Message) :
       else
         sendKeyUpdate state
 
+/-- The client's Certificate and, with an identity, CertificateVerify for a
+post-handshake CertificateRequest (RFC 9846 §4.6.2): the request's context, and
+a signature over the transcript through the Certificate. -/
+private def postHandshakeAuthentication (identity? : Option Identity)
+    (context transcript : ByteArray) : Except Error ByteArray := do
+  let certificate ← liftHandshake (Handshake.encodeClientCertificate
+    ((identity?.map (·.certificateChain)).getD #[]) context)
+  match identity? with
+  | none => pure certificate.encoded
+  | some identity =>
+    let content ← liftHandshake (TLS13.X509.Signature.clientCertificateVerifyContent
+      (HaclStar.sha256 (transcript ++ certificate.encoded)))
+    let signature := HaclStar.Signature.ed25519Sign identity.signingKey content
+    let verify ← liftHandshake (Handshake.encodeCertificateVerify Handshake.ed25519 signature)
+    pure (certificate.encoded ++ verify.encoded)
+
+/-- Answer a post-handshake CertificateRequest (RFC 9846 §4.6.2), under the
+current application write epoch: Certificate, CertificateVerify when this
+client has an identity and the server accepts Ed25519, and Finished, keyed by
+the current `client_application_traffic_secret_N`, over the handshake
+transcript, the request, and those messages. Refused unless post_handshake_auth
+was offered; nothing is sent once this side has closed. -/
+def answerCertificateRequest (state : State) (message : Handshake.Message) :
+    Except Error (State × ByteArray) := do
+  unless state.helloConfig.postHandshakeAuth do
+    throw (.unexpectedHandshake state.phase message.msgType)
+  let request ← liftHandshake (Handshake.parseCertificateRequest message true)
+  let writeKeys ← requireWriteKeys state
+  let transcript := state.handshakeTranscript ++ message.encoded
+  let identity? := if request.signatureAlgorithms.contains Handshake.ed25519 then
+    state.identity else none
+  let authentication ← postHandshakeAuthentication identity? request.context transcript
+  let finished ← liftHandshake (Handshake.encodeFinished
+    (finishedVerifyData writeKeys.secret (HaclStar.sha256 (transcript ++ authentication))))
+  let (writeKeys, wireBytes) ← sealClientFlight writeKeys (authentication ++ finished.encoded)
+  pure (if state.localClosed then (state, ByteArray.empty)
+    else ({ state with writeKeys? := some writeKeys }, wireBytes))
+
+/-- A post-handshake message other than NewSessionTicket: KeyUpdate or a
+CertificateRequest. -/
+def acceptPostHandshake (state : State) (message : Handshake.Message) :
+    Except Error (State × ByteArray) :=
+  if message.msgType == Handshake.keyUpdateType then acceptKeyUpdate state message
+  else answerCertificateRequest state message
+
 /-! Reduction lemmas used to prove that key updates and transcript appends
 leave the handshake buffer untouched, which bounds the
 `processHandshakeBuffer` recursion. -/
@@ -973,6 +1030,24 @@ private theorem acceptKeyUpdate_buffered {state next : State}
                   · cases h
                     rfl
                   · rw [sendKeyUpdate_buffered h]
+
+private theorem answerCertificateRequest_buffered {state next : State}
+    {message : Handshake.Message} {wireBytes : ByteArray}
+    (h : answerCertificateRequest state message = .ok (next, wireBytes)) :
+    next.handshakeBuffered = state.handshakeBuffered := by
+  unfold answerCertificateRequest at h
+  simp only [pure_bind, bind, Except.bind] at h
+  repeat' first | (split at h) | (cases h)
+  all_goals first | rfl | (split <;> rfl)
+
+private theorem acceptPostHandshake_buffered {state next : State}
+    {message : Handshake.Message} {wireBytes : ByteArray}
+    (h : acceptPostHandshake state message = .ok (next, wireBytes)) :
+    next.handshakeBuffered = state.handshakeBuffered := by
+  unfold acceptPostHandshake at h
+  split at h
+  · exact acceptKeyUpdate_buffered h
+  · exact answerCertificateRequest_buffered h
 
 /-- Keep a NewSessionTicket (RFC 9846 §4.6.1): its PSK is the resumption master
 secret expanded under "resumption" with the ticket's nonce. A ticket that does
@@ -1094,17 +1169,18 @@ def processHandshakeBuffer (state : State) :
     | .connected =>
         if message.msgType == Handshake.newSessionTicketType then
           processHandshakeBuffer (acceptTicket state' message)
-        else if message.msgType == Handshake.keyUpdateType then do
-          unless rest.isEmpty do
+        else if message.msgType == Handshake.keyUpdateType ||
+            message.msgType == Handshake.certificateRequestType then do
+          unless rest.isEmpty || message.msgType == Handshake.certificateRequestType do
             -- A KeyUpdate changes the record-protection epoch, so it must end
             -- the protected record in which it appears (RFC 9846 §5.1).
             throw .interleavedHandshake
-          match hacc : acceptKeyUpdate state' message with
+          match hacc : acceptPostHandshake state' message with
           | .error e => .error e
           | .ok (stateK, wireBytes) =>
             have hbuf : stateK.handshakeBuffered.size <
                 state.handshakeBuffered.size := by
-              rw [acceptKeyUpdate_buffered hacc]
+              rw [acceptPostHandshake_buffered hacc]
               exact hrest
             match processHandshakeBuffer stateK with
             | .error e => .error e

@@ -69,6 +69,8 @@ def keyShareExtension : UInt16 := 51
 def preSharedKeyExtension : UInt16 := 41
 def earlyDataExtension : UInt16 := 42
 def cookieExtension : UInt16 := 44
+/-- RFC 9846 §4.2.6: the client will answer a post-handshake CertificateRequest. -/
+def postHandshakeAuthExtension : UInt16 := 49
 def pskKeyExchangeModesExtension : UInt16 := 45
 def paddingExtension : UInt16 := 21
 -- application_layer_protocol_negotiation (RFC 7301).
@@ -480,6 +482,8 @@ structure ClientHelloConfig where
   `withPskBinder` replaces once it has been computed over
   `truncatedClientHello`. -/
   pskOffer : Option PskOffer := none
+  /-- Send post_handshake_auth (RFC 9846 §4.2.6). -/
+  postHandshakeAuth : Bool := false
   deriving Inhabited
 
 /-- Encode a client ALPN offer: a ProtocolNameList of length-prefixed names. -/
@@ -546,6 +550,11 @@ private def pskModesExtensionBytes : Bool → Except String ByteArray
   | false => pure ByteArray.empty
   | true => do
     encodeExtension pskKeyExchangeModesExtension (← encodeVector8 (ByteArray.empty.push pskDheKe))
+
+/-- post_handshake_auth, an empty extension, or nothing. -/
+private def postHandshakeAuthExtensionBytes : Bool → Except String ByteArray
+  | false => pure ByteArray.empty
+  | true => encodeExtension postHandshakeAuthExtension ByteArray.empty
 
 /-- The binders list a ClientHello offering one PSK ends with: a uint16 list
 length, a one-byte binder length and the 32-byte binder. -/
@@ -622,6 +631,7 @@ def encodeClientHello (cfg : ClientHelloConfig) : Except String Message := do
   extensions := extensions ++ (← serverNameExtensionBytes cfg.serverName)
   extensions := extensions ++ (← alpnExtensionBytes cfg.alpnProtocols)
   extensions := extensions ++ (← cookieExtensionBytes cfg.cookie)
+  extensions := extensions ++ (← postHandshakeAuthExtensionBytes cfg.postHandshakeAuth)
   extensions := extensions ++ (← pskModesExtensionBytes cfg.pskOffer.isSome)
   extensions := extensions ++ (← preSharedKeyExtensionBytes cfg.pskOffer)
 
@@ -964,17 +974,26 @@ structure CertificateVerify where
 negotiated). Unknown extensions are ignored, but duplicate extension IDs and
 missing/empty signature_algorithms are rejected by the shared strict codec. -/
 structure CertificateRequest where
+  /-- certificate_request_context: empty in the handshake, non-empty after it. -/
+  context : ByteArray := ByteArray.empty
   signatureAlgorithms : Array UInt16
   deriving Inhabited, BEq
 
 def certificateRequestType : UInt8 := 13
 
-def parseCertificateRequest (msg : Message) : Except String CertificateRequest := do
+/-- Parse a CertificateRequest. In the handshake its context must be empty;
+after it (RFC 9846 §4.6.2) the context must be non-empty. -/
+def parseCertificateRequest (msg : Message) (postHandshake : Bool := false) :
+    Except String CertificateRequest := do
   unless msg.msgType == certificateRequestType do
     throw "expected CertificateRequest"
   let (context, r) ← ({ bytes := msg.body } : Reader).readVector8
-  unless context.isEmpty do
-    throw "initial CertificateRequest context must be empty"
+  if postHandshake then
+    if context.isEmpty then
+      throw "post-handshake CertificateRequest context must not be empty"
+  else
+    unless context.isEmpty do
+      throw "initial CertificateRequest context must be empty"
   let (bytes, r) ← r.readVector16
   r.requireEnd "CertificateRequest"
   let extensions ← parseExtensions bytes
@@ -988,16 +1007,18 @@ def parseCertificateRequest (msg : Message) : Except String CertificateRequest :
   for i in [:bytes.size / 2] do
     result := result.push ((UInt16.ofNat (bytes.get! (2*i)).toNat <<< 8) |||
       UInt16.ofNat (bytes.get! (2*i+1)).toNat)
-  pure { signatureAlgorithms := result }
+  pure { context, signatureAlgorithms := result }
 
-/-- Client Certificate has the same grammar but permits an empty chain.
-Request contexts must be empty in the initial handshake. -/
-def parseClientCertificate (msg : Message) : Except String (Array CertificateEntry) := do
+/-- Client Certificate has the same grammar but permits an empty chain. Its
+request context must equal the CertificateRequest's: empty in the initial
+handshake, the request's own context after it. -/
+def parseClientCertificate (msg : Message) (expectedContext : ByteArray := ByteArray.empty) :
+    Except String (Array CertificateEntry) := do
   unless msg.msgType == certificateType do
     throw "expected client Certificate"
   let (context, r) ← ({ bytes := msg.body } : Reader).readVector8
-  unless context.isEmpty do
-    throw "initial client Certificate context must be empty"
+  unless context == expectedContext do
+    throw "client Certificate context does not match the CertificateRequest"
   let (bytes, r) ← r.readVector24
   r.requireEnd "client Certificate"
   let entries ← parseCertificateEntries { bytes } #[]
@@ -1906,15 +1927,17 @@ def encodeCertificateVerify (algorithm : UInt16) (signature : ByteArray) :
   frame certificateVerifyType
     (appendUInt16 ByteArray.empty algorithm ++ (← encodeVector16 signature))
 
-def encodeCertificateRequest : Except String Message := do
+def encodeCertificateRequest (context : ByteArray := ByteArray.empty) :
+    Except String Message := do
   let algorithms := appendUInt16 ByteArray.empty ed25519
   let extension ← encodeExtension signatureAlgorithmsExtension (← encodeVector16 algorithms)
-  frame certificateRequestType ((← encodeVector8 ByteArray.empty) ++
+  frame certificateRequestType ((← encodeVector8 context) ++
     (← encodeVector16 extension))
 
-def encodeClientCertificate (chain : Array ByteArray) : Except String Message := do
+def encodeClientCertificate (chain : Array ByteArray) (context : ByteArray := ByteArray.empty) :
+    Except String Message := do
   let list ← encodeCertificateList chain.toList
-  frame certificateType ((← encodeVector8 ByteArray.empty) ++ (← encodeVector24 list))
+  frame certificateType ((← encodeVector8 context) ++ (← encodeVector24 list))
 
 /-!
 ## Wire-codec roundtrip laws
@@ -2313,6 +2336,7 @@ private theorem encodeClientHello_frame {cfg : ClientHelloConfig}
       · obtain ⟨_, hu, _⟩ := bind_ok_ex h
         cases hu
       · obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
         obtain ⟨_, _, h⟩ := bind_ok_ex h
         obtain ⟨_, _, h⟩ := bind_ok_ex h
         obtain ⟨_, _, h⟩ := bind_ok_ex h

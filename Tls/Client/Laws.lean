@@ -230,6 +230,7 @@ private theorem acceptKeyUpdate_write {state next : State}
       exact hw
 
 
+
 private theorem unless_ok {α : Type} {c : Bool} {e : Error}
     {f : PUnit → Except Error α} {b : α}
     (h : (if c = true then (pure PUnit.unit : Except Error PUnit) >>= f
@@ -333,6 +334,56 @@ private theorem sealClientFlight_epochs {H : TLS13.KeySchedule.Spec.Hkdf}
   termination_by flight.size - offset
   decreasing_by omega
 
+
+private theorem sealClientFlight_rolled {H : TLS13.KeySchedule.Spec.Hkdf}
+    {keys keys' : Record.TrafficKeys} {flight : ByteArray} {offset : Nat}
+    {wire wireOut : ByteArray}
+    (h : sealClientFlight keys flight offset wire = .ok (keys', wireOut)) :
+    Record.Rolled H (some keys) (some keys') := by
+  unfold sealClientFlight at h
+  split at h
+  · cases h; exact Record.Rolled.refl _
+  · simp only [] at h
+    split at h
+    · cases h
+    · rename_i nextKeys record hseal
+      exact (Record.Rolled.of_seal (liftRecord_ok hseal)).trans (sealClientFlight_rolled h)
+  termination_by flight.size - offset
+  decreasing_by omega
+
+/-- Answering a post-handshake CertificateRequest either sends nothing (this
+side has closed) or seals one flight under the current write epoch; nothing
+else about the connection changes. -/
+private theorem answerCertificateRequest_sends {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : answerCertificateRequest state message = .ok (next, wire)) :
+    next = state ∨ ∃ (keys keys' : Record.TrafficKeys) (flight : ByteArray),
+      requireWriteKeys state = .ok keys ∧ sealClientFlight keys flight = .ok (keys', wire) ∧
+      next = { state with writeKeys? := some keys' } := by
+  unfold answerCertificateRequest at h
+  simp only [pure_bind] at h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨request, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+  obtain ⟨authentication, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨finished, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, hs, h⟩ := except_bind_ok_inv h
+  obtain ⟨keys', wireBytes⟩ := sealed
+  split at h
+  · cases h; exact Or.inl rfl
+  · cases h; exact Or.inr ⟨keys, keys', _, hk, hs, rfl⟩
+
+private theorem acceptPostHandshake_write {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptPostHandshake state message = .ok (next, wire)) :
+    WriteEffect state next := by
+  unfold acceptPostHandshake at h
+  split at h
+  · exact acceptKeyUpdate_write h
+  · rcases answerCertificateRequest_sends h with rfl | ⟨keys, keys', _, hk, hs, rfl⟩
+    · exact Record.Extends.refl _
+    · show Record.Extends state.writeKeys? (some keys')
+      rw [requireWriteKeys_ok hk]; exact sealClientFlight_write hs
 /-- Completing the handshake seals the client Finished under the handshake write
 epoch and then installs the application epoch — both accounted for. -/
 private theorem completeServerHandshake_write {state next : State}
@@ -423,10 +474,10 @@ private theorem processHandshakeBuffer_write {state next : State} {wire : ByteAr
             · cases h
             · rename_i stateF moreWire hnext
               cases h
-              have h1 := acceptKeyUpdate_write hacc
+              have h1 := acceptPostHandshake_write hacc
               have hbuf : stateK.handshakeBuffered.size <
                   state.handshakeBuffered.size := by
-                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+                rw [acceptPostHandshake_buffered hacc]; exact hsize
               have h2 := processHandshakeBuffer_write hnext
               exact Record.Extends.trans h1 h2
         · cases h
@@ -1132,6 +1183,18 @@ private theorem acceptKeyUpdate_wellFormed {state next : State}
         (wellFormed_transfer hinv rfl (.inl rfl)
           (.inr ⟨⟨_, rfl⟩, hsome⟩) rfl rfl rfl rfl)
 
+
+private theorem acceptPostHandshake_wellFormed {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptPostHandshake state message = .ok (next, wire))
+    (hinv : state.WellFormed) : next.WellFormed := by
+  unfold acceptPostHandshake at h
+  split at h
+  · exact acceptKeyUpdate_wellFormed h hinv
+  · rcases answerCertificateRequest_sends h with rfl | ⟨keys, keys', _, hk, hs, rfl⟩
+    · exact hinv
+    · exact wellFormed_transfer hinv rfl (.inr ⟨⟨_, rfl⟩, requireWriteKeys_isSome hk⟩)
+        (.inl rfl) rfl rfl rfl rfl
 private theorem acceptServerHello_wellFormed {state next : State}
     {message : Handshake.Message}
     (h : acceptServerHello state message = .ok next) : next.WellFormed := by
@@ -1276,9 +1339,9 @@ private theorem processHandshakeBuffer_wellFormed {state next : State}
             · rename_i stateF moreWire hnext
               have hbuf : stateK.handshakeBuffered.size <
                   state.handshakeBuffered.size := by
-                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+                rw [acceptPostHandshake_buffered hacc]; exact hsize
               have h2 := processHandshakeBuffer_wellFormed hnext
-                (acceptKeyUpdate_wellFormed hacc hinv)
+                (acceptPostHandshake_wellFormed hacc hinv)
               cases h
               exact h2
         · cases h
@@ -1553,6 +1616,15 @@ private theorem acceptKeyUpdate_phase {state next : State}
     · have hp := sendKeyUpdate_phase h
       exact hp
 
+
+private theorem acceptPostHandshake_phase {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptPostHandshake state message = .ok (next, wire)) :
+    next.phase = state.phase := by
+  unfold acceptPostHandshake at h
+  split at h
+  · exact acceptKeyUpdate_phase h
+  · rcases answerCertificateRequest_sends h with rfl | ⟨keys, keys', _, hk, hs, rfl⟩ <;> rfl
 /-- Post-handshake messages do not leave `connected`: the only ones the engine
 accepts there are NewSessionTicket (discarded) and KeyUpdate (an epoch change,
 not a phase change). -/
@@ -1594,9 +1666,9 @@ private theorem processHandshakeBuffer_connected {state next : State}
             · rename_i stateF moreWire hnext
               have hbuf : stateK.handshakeBuffered.size <
                   state.handshakeBuffered.size := by
-                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+                rw [acceptPostHandshake_buffered hacc]; exact hsize
               have hck : stateK.phase = Phase.connected := by
-                rw [acceptKeyUpdate_phase hacc]; exact hc
+                rw [acceptPostHandshake_phase hacc]; exact hc
               have h2 := processHandshakeBuffer_connected hnext hck
               cases h
               exact h2
@@ -2514,6 +2586,31 @@ theorem completeServerHandshake_resumptionMaster {H : Spec.Hkdf} (hi : Implement
     cases h
     exact congrArg some he
 
+/-- **A post-handshake CertificateRequest is answered only when
+post_handshake_auth was offered, and the Finished is RFC 9846 §4.6.2's**: keyed
+by §4.4.4's `finished_key` of the current `client_application_traffic_secret_N`
+(the write epoch's secret), over the hash of the handshake transcript, the
+CertificateRequest, and the client's Certificate (and CertificateVerify). -/
+theorem answerCertificateRequest_finished {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {message : Handshake.Message} {wire : ByteArray}
+    (h : answerCertificateRequest state message = .ok (next, wire)) :
+    state.helloConfig.postHandshakeAuth = true ∧
+    ∃ (keys : Record.TrafficKeys) (authentication : ByteArray) (finished : Handshake.Message),
+      state.writeKeys? = some keys ∧
+      Handshake.encodeFinished (HaclStar.hmacSha256 (Spec.finishedKey H keys.secret)
+        (HaclStar.sha256 (state.handshakeTranscript ++ message.encoded ++ authentication))) =
+        .ok finished := by
+  unfold answerCertificateRequest at h
+  simp only [pure_bind] at h
+  obtain ⟨hpha, h⟩ := unless_ok h
+  obtain ⟨request, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+  obtain ⟨authentication, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨finished, hf, h⟩ := except_bind_ok_inv h
+  refine ⟨hpha, keys, authentication, finished, requireWriteKeys_ok hk, ?_⟩
+  rw [← finishedVerifyData_spec hi]
+  exact liftHandshake_ok hf
+
 /-- **The exporter is RFC 9846 §7.5's `TLS-Exporter`** over the connection's
 stored exporter master secret, with `Hash("")` for the `Derive-Secret` step and
 `Hash(context)` for the `"exporter"` expansion. Together with
@@ -2621,6 +2718,15 @@ private theorem acceptKeyUpdate_handshakeSecret {state next : State}
     · cases h; rfl
     · rw [sendKeyUpdate_handshakeSecret h]
 
+
+private theorem acceptPostHandshake_handshakeSecret {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptPostHandshake state message = .ok (next, wire)) :
+    next.handshakeSecret? = state.handshakeSecret? := by
+  unfold acceptPostHandshake at h
+  split at h
+  · exact acceptKeyUpdate_handshakeSecret h
+  · rcases answerCertificateRequest_sends h with rfl | ⟨keys, keys', _, hk, hs, rfl⟩ <;> rfl
 /-- **The client's whole encrypted server flight installs the RFC 8446 §7.1
 application epochs.** `processHandshakeBuffer` consumes EncryptedExtensions,
 Certificate, CertificateVerify and the server Finished in one call. Either it
@@ -2707,8 +2813,8 @@ theorem processHandshakeBuffer_keySchedule {H : Spec.Hkdf} (hi : Implements H)
               cases h
               have hbuf : stateK.handshakeBuffered.size <
                   state.handshakeBuffered.size := by
-                rw [acceptKeyUpdate_buffered hacc]; exact hsize
-              have hk := acceptKeyUpdate_handshakeSecret hacc
+                rw [acceptPostHandshake_buffered hacc]; exact hsize
+              have hk := acceptPostHandshake_handshakeSecret hacc
               rcases processHandshakeBuffer_keySchedule hi hnext with hl | ⟨t, ht⟩
               · exact Or.inl (by rw [hl, hk])
               · exact Or.inr ⟨t, fun inp h1 h2 h3 => ht inp h1 h2 (by rw [hk]; exact h3)⟩
@@ -3017,6 +3123,20 @@ private theorem acceptKeyUpdate_epochs {H : Spec.Hkdf} (hi : Implements H)
     · have hw := sendKeyUpdate_epochs hi h
       exact SpecEffect.of_eq hw rfl rfl
 
+
+private theorem acceptPostHandshake_epochs {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptPostHandshake state message = .ok (next, wire)) :
+    SpecEffect H state next := by
+  unfold acceptPostHandshake at h
+  split at h
+  · exact acceptKeyUpdate_epochs hi h
+  · rcases answerCertificateRequest_sends h with rfl | ⟨keys, keys', _, hk, hs, rfl⟩
+    · exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
+    · refine SpecEffect.within rfl ?_
+      show Record.WithinEpoch H state.writeKeys? (some keys')
+      rw [requireWriteKeys_ok hk]; exact sealClientFlight_epochs hs
 /-- **Accepting the ServerHello installs the connection's first write epoch.**
 The `waitingServerHello` clause of `State.WellFormed` is what makes this an
 installation rather than a replacement: there was no epoch to abandon, so no
@@ -3212,10 +3332,10 @@ private theorem processHandshakeBuffer_epochs {H : Spec.Hkdf} (hi : Implements H
               cases h
               have hbuf : stateK.handshakeBuffered.size <
                   state.handshakeBuffered.size := by
-                rw [acceptKeyUpdate_buffered hacc]; exact hsize
-              have hinvK := acceptKeyUpdate_wellFormed hacc
+                rw [acceptPostHandshake_buffered hacc]; exact hsize
+              have hinvK := acceptPostHandshake_wellFormed hacc
                 (wellFormed_transfer hinv rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
-              have h1 := acceptKeyUpdate_epochs hi hacc
+              have h1 := acceptPostHandshake_epochs hi hacc
               have h2 := processHandshakeBuffer_epochs hi hnext hinvK
               exact SpecEffect.of_eq (SpecEffect.trans h1 h2) rfl rfl
         · cases h
@@ -3578,6 +3698,20 @@ private theorem acceptKeyUpdate_rolled {H : Spec.Hkdf} (hi : Implements H)
     · cases h; exact hstep
     · exact hstep.trans (sendKeyUpdate_rolled hi h)
 
+
+private theorem acceptPostHandshake_rolled {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptPostHandshake state message = .ok (next, wire)) :
+    RolledEpochs H state next := by
+  unfold acceptPostHandshake at h
+  split at h
+  · exact acceptKeyUpdate_rolled hi h
+  · rcases answerCertificateRequest_sends h with rfl | ⟨keys, keys', _, hk, hs, rfl⟩
+    · exact RolledEpochs.refl _
+    · refine ⟨Record.Rolled.refl _, ?_, rfl⟩
+      show Record.Rolled H state.writeKeys? (some keys')
+      rw [requireWriteKeys_ok hk]; exact sealClientFlight_rolled hs
 /-- In `connected` the only post-handshake messages the engine accepts are
 NewSessionTicket, which touches no key state, and KeyUpdate, which rolls the
 epochs forward. -/
@@ -3620,10 +3754,10 @@ private theorem processHandshakeBuffer_rolled {H : Spec.Hkdf} (hi : Implements H
             · rename_i stateF moreWire hnext
               have hbuf : stateK.handshakeBuffered.size <
                   state.handshakeBuffered.size := by
-                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+                rw [acceptPostHandshake_buffered hacc]; exact hsize
               have hck : stateK.phase = Phase.connected := by
-                rw [acceptKeyUpdate_phase hacc]; exact hc
-              have h1 := acceptKeyUpdate_rolled hi hacc
+                rw [acceptPostHandshake_phase hacc]; exact hc
+              have h1 := acceptPostHandshake_rolled hi hacc
               have h2 := processHandshakeBuffer_rolled hi hnext hck
               cases h
               exact h1.trans h2
@@ -3820,9 +3954,9 @@ private theorem processHandshakeBuffer_phase_ne {state next : State}
             · rename_i stateF moreWire hnext
               have hbuf : stateK.handshakeBuffered.size <
                   state.handshakeBuffered.size := by
-                rw [acceptKeyUpdate_buffered hacc]; exact hsize
+                rw [acceptPostHandshake_buffered hacc]; exact hsize
               have hck : stateK.phase ≠ Phase.waitingServerHello := by
-                rw [acceptKeyUpdate_phase hacc, hc]; intro hx; cases hx
+                rw [acceptPostHandshake_phase hacc, hc]; intro hx; cases hx
               have h2 := processHandshakeBuffer_phase_ne hnext hck
               cases h
               exact h2
@@ -4006,8 +4140,8 @@ private theorem processHandshakeBuffer_established {H : Spec.Hkdf} (hi : Impleme
               cases h
               have hbuf : stateK.handshakeBuffered.size <
                   state.handshakeBuffered.size := by
-                rw [acceptKeyUpdate_buffered hacc]; exact hsize
-              have hk := acceptKeyUpdate_handshakeSecret hacc
+                rw [acceptPostHandshake_buffered hacc]; exact hsize
+              have hk := acceptPostHandshake_handshakeSecret hacc
               rcases processHandshakeBuffer_established hi hnext with hl | ⟨hcon, t, ht⟩
               · exact Or.inl (by rw [hl, hk])
               · exact Or.inr ⟨hcon, t, fun inp h1 h2 h3 => ht inp h1 h2 (by rw [hk]; exact h3)⟩

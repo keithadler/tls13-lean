@@ -51,6 +51,20 @@ structure ClientAuthPolicy where
   maximumCertificates : Nat := 10
   deriving Inhabited
 
+/-- An outstanding post-handshake CertificateRequest (RFC 9846 §4.6.2) and the
+client's answer so far, kept apart from the handshake's own client-auth fields
+so that a connected server never looks mid-handshake. -/
+structure PostAuth where
+  policy : ClientAuthPolicy
+  context : ByteArray
+  /-- The handshake transcript, the CertificateRequest, and what has arrived. -/
+  transcript : ByteArray
+  expectedFinished? : Option ByteArray := none
+  received : Bool := false
+  verified : Bool := false
+  pending : Array TLS13.X509.Certificate := #[]
+  peer : Array TLS13.X509.Certificate := #[]
+
 /-- The algorithm the server's CertificateVerify is signed with. -/
 inductive SigningAlgorithm where
   /-- RFC 8032 Ed25519 (`ed25519`, 0x0807). -/
@@ -103,6 +117,10 @@ structure Config where
   /-- The current time, in milliseconds since the Unix epoch, for stamping new
   tickets and checking an offered ticket's lifetime. The engine reads no clock. -/
   nowMs : Nat := 0
+  /-- Validation policy for client certificates requested after the handshake
+  (RFC 9846 §4.6.2), with `requestClientCertificate`, when the client offered
+  post_handshake_auth. -/
+  postHandshakeAuth : Option ClientAuthPolicy := none
   deriving Inhabited
 
 inductive Phase where
@@ -279,6 +297,19 @@ structure State where
   ticketsIssued : Nat := 0
   /-- This connection resumed a session with a PSK. -/
   resumed : Bool := false
+  postHandshakeAuth : Option ClientAuthPolicy := none
+  /-- The ClientHello carried post_handshake_auth. -/
+  clientOffersPostHandshakeAuth : Bool := false
+  /-- ClientHello…client Finished, kept once connected when post-handshake
+  authentication is possible: each such authentication binds it. -/
+  handshakeTranscript : ByteArray := ByteArray.empty
+  /-- The outstanding post-handshake CertificateRequest, if any. -/
+  postAuth? : Option PostAuth := none
+  /-- The certificate_request_context client Certificates must carry: empty in
+  the handshake, the request's own context after it. -/
+  certificateRequestContext : ByteArray := ByteArray.empty
+  /-- Post-handshake client authentications completed. -/
+  postHandshakeAuthentications : Nat := 0
   /-- RFC 9846 §7.1 `exporter_master_secret`, derived with the server flight and
   served by `exportKeyingMaterial` once the client Finished verifies. -/
   exporterMasterSecret? : Option ByteArray := none
@@ -422,6 +453,7 @@ def start (config : Config) : State :=
     ticketKey := config.ticketKey
     ticketLifetime := config.ticketLifetime
     nowMs := config.nowMs
+    postHandshakeAuth := config.postHandshakeAuth
   }
 
 private def clientShare? (hello : Handshake.ClientHello) (group : Handshake.NamedGroup) :
@@ -789,6 +821,8 @@ def completeClientHello (state : State) (hello : Handshake.ClientHello)
     retryGroup? := none
     retryHello? := none
     compatibilityCcsSent := state.compatibilityCcsSent || sendCompatibilityCcs
+    clientOffersPostHandshakeAuth := hello.extensions.any
+      (·.extensionType == Handshake.postHandshakeAuthExtension)
   }, wireBytes)
 
 /-! ## Session tickets and resumption (RFC 9846 §2.2, §4.2.11, §4.6.1)
@@ -945,6 +979,8 @@ def completePskClientHello (state : State) (hello : Handshake.ClientHello)
     retryHello? := none
     compatibilityCcsSent := state.compatibilityCcsSent || sendCompatibilityCcs
     resumed := true
+    clientOffersPostHandshakeAuth := hello.extensions.any
+      (·.extensionType == Handshake.postHandshakeAuthExtension)
   }, wireBytes)
 
 /-- Resume when the ClientHello offers a ticket this server accepts
@@ -1037,6 +1073,10 @@ def acceptClientFinished (state : State) (message : Handshake.Message) :
       TLS13.KeySchedule.deriveSecret master "res master"
         (HaclStar.sha256 (state.transcript ++ message.encoded))
     masterSecret? := none
+    handshakeTranscript :=
+      if state.clientOffersPostHandshakeAuth && state.postHandshakeAuth.isSome then
+        state.transcript ++ message.encoded
+      else ByteArray.empty
     transcript := ByteArray.empty
     pendingClientCertificates := #[]
   }
@@ -1058,7 +1098,8 @@ private def acceptClientAuthentication (state : State) (message : Handshake.Mess
       throw (.unexpectedHandshake state.phase message.msgType)
     unless message.body.size ≤ policy.maximumCertificateBytes do
       throw .badClientCertificate
-    let entries ← liftHandshake (Handshake.parseClientCertificate message)
+    let entries ← liftHandshake
+      (Handshake.parseClientCertificate message state.certificateRequestContext)
     unless entries.size ≤ policy.maximumCertificates do
       throw .badClientCertificate
     if entries.isEmpty then
@@ -1133,7 +1174,51 @@ private def prepareClientFlight (state : State) : Except Error State := do
       clientCertificateVerified := auth.clientCertificateVerified
       pendingClientCertificates := auth.pendingClientCertificates
       peerCertificates := auth.peerCertificates }
+  else if state.phase == .connected then
+    match state.postAuth?, state.readKeys? with
+    | some pending, some readKeys =>
+      -- RFC 9846 §4.6.2: the client answers under its current application
+      -- epoch, whose secret keys the Finished it will send.
+      let (auth, buffer) ← consumeClientAuthentication { state with
+        clientAuth := some pending.policy
+        clientHandshakeSecret? := some readKeys.secret
+        certificateRequestContext := pending.context
+        transcript := pending.transcript
+        expectedClientFinished? := pending.expectedFinished?
+        clientCertificateReceived := pending.received
+        clientCertificateVerified := pending.verified
+        pendingClientCertificates := pending.pending
+        peerCertificates := pending.peer } state.handshakeBuffered
+      pure { state with
+        handshakeBuffered := buffer
+        postAuth? := some { pending with
+          transcript := auth.transcript
+          expectedFinished? := auth.expectedClientFinished?
+          received := auth.clientCertificateReceived
+          verified := auth.clientCertificateVerified
+          pending := auth.pendingClientCertificates
+          peer := auth.peerCertificates } }
+    | _, _ => pure state
   else pure state
+
+/-- The client Finished that completes a post-handshake authentication: it must
+match the one expected after the client's Certificate (and CertificateVerify),
+which must have been validated. The certificates become the peer's. -/
+def acceptPostHandshakeFinished (state : State) (message : Handshake.Message) :
+    Except Error State := do
+  let finished ← liftHandshake (Handshake.parseFinished message)
+  let some pending := state.postAuth?
+    | throw (.unexpectedHandshake state.phase message.msgType)
+  let some expected := pending.expectedFinished?
+    | throw (.unexpectedHandshake state.phase message.msgType)
+  unless constantTimeEq expected finished.verifyData do
+    throw .clientFinishedMismatch
+  unless pending.received && pending.verified do
+    throw .clientCertificateRequired
+  pure { state with
+    postAuth? := none
+    peerCertificates := if pending.peer.isEmpty then state.peerCertificates else pending.peer
+    postHandshakeAuthentications := state.postHandshakeAuthentications + 1 }
 
 private def emitCloseNotify (state : State) : Except Error (State × ByteArray) := do
   if state.localClosed then
@@ -1252,6 +1337,37 @@ def issueTicket (state : State) (ageAdd : UInt32) (sealNonce : ByteArray) :
     state := { state with writeKeys? := some writeKeys, ticketsIssued := state.ticketsIssued + 1 }
     wireBytes
   }
+
+/-- Ask the client for a certificate after the handshake (RFC 9846 §4.6.2): a
+CertificateRequest with a fresh non-empty `context` (at most 255 bytes), under
+the current write epoch. The client must have offered post_handshake_auth and
+`postHandshakeAuth` must be configured; one request is outstanding at a time.
+The answer arrives through `feed`; `postHandshakeAuthentications` counts the
+completed ones and `peerCertificates` holds the validated chain. -/
+def requestClientCertificate (state : State) (context : ByteArray) :
+    Except Error Output := do
+  unless state.phase == .connected do
+    throw (.notConnected state.phase)
+  if state.localClosed then
+    throw .connectionClosed
+  let some policy := state.postHandshakeAuth
+    | throw (.invalidConfig "no post-handshake client authentication policy")
+  unless state.clientOffersPostHandshakeAuth && state.postAuth?.isNone &&
+      !context.isEmpty && context.size ≤ 255 do
+    throw (.invalidConfig "cannot send a post-handshake CertificateRequest now")
+  let request ← liftHandshake (Handshake.encodeCertificateRequest context)
+  let writeKeys ← requireWriteKeys state
+  let (writeKeys, wireBytes) ←
+    liftRecord (Record.«seal» writeKeys .handshake request.encoded)
+  let pending : PostAuth := {
+    policy := policy
+    context := context
+    transcript := state.handshakeTranscript ++ request.encoded }
+  pure {
+    state := { state with writeKeys? := some writeKeys, postAuth? := some pending }
+    wireBytes
+  }
+
 
 
 
@@ -1383,7 +1499,12 @@ private def processHandshakeBuffer (state : State) :
         let stateF ← acceptClientFinished state' message
         pure (stateF, ByteArray.empty)
     | .connected =>
-        if message.msgType == Handshake.keyUpdateType then do
+        if message.msgType == Handshake.finishedType && state'.postAuth?.isSome then do
+          unless rest.isEmpty do
+            throw .interleavedHandshake
+          let stateF ← acceptPostHandshakeFinished state' message
+          pure (stateF, ByteArray.empty)
+        else if message.msgType == Handshake.keyUpdateType then do
           -- KeyUpdate must be aligned to the end of its protected handshake
           -- record: trailing bytes were decrypted under the old read epoch.
           unless rest.isEmpty do
@@ -1610,6 +1731,8 @@ inductive Op where
   | keyUpdate (requestPeer : Bool)
   /-- Send a NewSessionTicket with a fresh ticket_age_add and seal nonce. -/
   | issueTicket (ageAdd : UInt32) (sealNonce : ByteArray)
+  /-- Ask for a client certificate after the handshake. -/
+  | requestClientCertificate (context : ByteArray)
   deriving Inhabited
 
 def step (state : State) (op : Op) : Except Error Output :=
@@ -1620,6 +1743,7 @@ def step (state : State) (op : Op) : Except Error Output :=
   | .fatalAlert description => sealFatalAlert state description
   | .keyUpdate requestPeer => updateKeys state requestPeer
   | .issueTicket ageAdd sealNonce => issueTicket state ageAdd sealNonce
+  | .requestClientCertificate context => requestClientCertificate state context
 
 /-- Drive a sequence of operations from `state`, concatenating produced wire
 bytes and plaintext in order. -/
