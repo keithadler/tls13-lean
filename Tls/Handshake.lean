@@ -455,6 +455,15 @@ structure ClientHelloConfig where
   legacySessionId : ByteArray := ByteArray.empty
   /-- ALPN protocols to offer, in client preference order (empty omits ALPN). -/
   alpnProtocols : Array String := #[]
+  /-- List secp256r1 in supported_groups even without a P-256 key share, so a
+  server that prefers it can ask for one with a HelloRetryRequest. -/
+  offerP256 : Bool := false
+  /-- Send the X25519 key share. A second ClientHello after a HelloRetryRequest
+  that selected another group carries only that group's share. -/
+  sendX25519Share : Bool := true
+  /-- The cookie extension body a HelloRetryRequest carried, echoed verbatim in
+  the second ClientHello (RFC 9846 §4.2.2). -/
+  cookie : Option ByteArray := none
   deriving Inhabited
 
 /-- Encode a client ALPN offer: a ProtocolNameList of length-prefixed names. -/
@@ -490,10 +499,12 @@ private def signatureAlgorithmsClientExtension : Except String ByteArray := do
   ].foldl appendUInt16 ByteArray.empty
   encodeExtension signatureAlgorithmsExtension (← encodeVector16 algorithms)
 
-private def keyShareClientExtension (x25519PublicKey : ByteArray)
+private def keyShareClientExtension (x25519PublicKey : Option ByteArray)
     (p256PublicKey : Option ByteArray) : Except String ByteArray := do
-  let mut entries :=
-    appendUInt16 ByteArray.empty x25519Group ++ (← encodeVector16 x25519PublicKey)
+  let mut entries := ByteArray.empty
+  if let some publicKey := x25519PublicKey then
+    entries := entries ++ appendUInt16 ByteArray.empty x25519Group ++
+      (← encodeVector16 publicKey)
   if let some publicKey := p256PublicKey then
     entries := entries ++ appendUInt16 ByteArray.empty secp256r1Group ++
       (← encodeVector16 publicKey)
@@ -507,6 +518,12 @@ private def serverNameClientExtension (name : String) : Except String ByteArray 
     throw "SNI server name must not contain NUL"
   let hostName := ByteArray.empty.push 0 ++ (← encodeVector16 nameBytes)
   encodeExtension serverNameExtension (← encodeVector16 hostName)
+
+/-- The cookie extension, or nothing. `body` is the extension body exactly as
+the HelloRetryRequest carried it. -/
+private def cookieExtensionBytes : Option ByteArray → Except String ByteArray
+  | none => pure ByteArray.empty
+  | some body => encodeExtension cookieExtension body
 
 /-- Validate an optional first-flight P-256 share. Split out (like the two
 optional-extension helpers below) so the `encodeClientHello` do-chain stays
@@ -538,19 +555,22 @@ TLS 1.3 only, the supported certificate-signature schemes, and optional SNI.
 def encodeClientHello (cfg : ClientHelloConfig) : Except String Message := do
   unless cfg.random.size == 32 do
     throw s!"ClientHello random must be 32 bytes, got {cfg.random.size}"
-  unless cfg.x25519PublicKey.size == 32 do
+  unless !cfg.sendX25519Share || cfg.x25519PublicKey.size == 32 do
     throw s!"x25519 public key must be 32 bytes, got {cfg.x25519PublicKey.size}"
   checkP256PublicKey cfg.p256PublicKey
   if cfg.legacySessionId.size > 32 then
     throw s!"legacy session id exceeds 32 bytes ({cfg.legacySessionId.size})"
 
   let mut extensions := ← supportedVersionsClientExtension
-  extensions := extensions ++ (← supportedGroupsClientExtension cfg.p256PublicKey.isSome)
+  extensions := extensions ++
+    (← supportedGroupsClientExtension (cfg.offerP256 || cfg.p256PublicKey.isSome))
   extensions := extensions ++ (← signatureAlgorithmsClientExtension)
   extensions := extensions ++
-    (← keyShareClientExtension cfg.x25519PublicKey cfg.p256PublicKey)
+    (← keyShareClientExtension
+      (if cfg.sendX25519Share then some cfg.x25519PublicKey else none) cfg.p256PublicKey)
   extensions := extensions ++ (← serverNameExtensionBytes cfg.serverName)
   extensions := extensions ++ (← alpnExtensionBytes cfg.alpnProtocols)
+  extensions := extensions ++ (← cookieExtensionBytes cfg.cookie)
 
   let mut body := appendUInt16 ByteArray.empty legacyTls12Version
   body := body ++ cfg.random
@@ -2141,6 +2161,7 @@ private theorem encodeClientHello_frame {cfg : ClientHelloConfig}
       · obtain ⟨_, hu, _⟩ := bind_ok_ex h
         cases hu
       · obtain ⟨_, _, h⟩ := bind_ok_ex h
+        obtain ⟨_, _, h⟩ := bind_ok_ex h
         obtain ⟨_, _, h⟩ := bind_ok_ex h
         obtain ⟨_, _, h⟩ := bind_ok_ex h
         obtain ⟨_, _, h⟩ := bind_ok_ex h

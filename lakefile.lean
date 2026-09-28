@@ -95,3 +95,5 @@ meta if (get_config? hacl).isSome then do
   lean_exe x509_hostname_test where root := `Test.X509HostnameTest
   lean_exe x509_channel_binding_test where root := `Test.X509ChannelBindingTest
   lean_exe tls_external_server where root := `Test.TlsExternalServer
+  lean_exe tls_external_client where root := `Test.TlsExternalClient
+  lean_exe tls_client_retry_test where root := `Test.TlsClientRetryTest

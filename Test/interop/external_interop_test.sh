@@ -65,9 +65,11 @@ runfile() {
 }
 
 SERVER_BIN="$(runfile Test/tls_external_server)"
+CLIENT_BIN="$(runfile Test/tls_external_client)"
 CERT="$(runfile Test/Fixtures/Tls/server_cert.pem)"
 GO_SRC="$(runfile Test/interop/goclient/main.go)"
 [[ -x "${SERVER_BIN}" ]] || { echo "server harness not found" >&2; exit 1; }
+[[ -x "${CLIENT_BIN}" ]] || { echo "client harness not found" >&2; exit 1; }
 [[ -f "${CERT}" ]] || { echo "certificate fixture not found" >&2; exit 1; }
 command -v openssl >/dev/null || { echo "openssl not on PATH" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl not on PATH" >&2; exit 1; }
@@ -76,6 +78,7 @@ command -v curl >/dev/null || { echo "curl not on PATH" >&2; exit 1; }
 # run it from the directory that contains that relative path (the runfiles
 # root under bazel test, the repository root otherwise).
 SERVER_BIN="$(cd "$(dirname "${SERVER_BIN}")" && pwd)/$(basename "${SERVER_BIN}")"
+CLIENT_BIN="$(cd "$(dirname "${CLIENT_BIN}")" && pwd)/$(basename "${CLIENT_BIN}")"
 CERT="$(cd "$(dirname "${CERT}")" && pwd)/$(basename "${CERT}")"
 SERVER_CWD="$(cd "$(dirname "${CERT}")/../../.." && pwd)"
 [[ -z "${GO_SRC}" ]] || GO_SRC="$(cd "$(dirname "${GO_SRC}")" && pwd)/$(basename "${GO_SRC}")"
@@ -294,6 +297,76 @@ if run_openssl openssl-mtls \
   fi
 fi
 unset TLS13_TEST_CLIENT_CA
+
+# --- The Lean client against OpenSSL s_server. ---
+# A throwaway CA and P-256 leaf for "localhost", made per run. s_server only
+# accepts P-256, while the client's first flight carries only an X25519 share
+# and lists P-256, so the server must answer with a HelloRetryRequest
+# (RFC 9846 §4.1.4) and the second ClientHello carries the P-256 share.
+PKI="${WORK}/pki"
+mkdir -p "${PKI}"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout "${PKI}/ca.key" -out "${PKI}/ca.pem" -days 2 -subj /CN=tls13-lean-test-ca \
+  -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign \
+  >/dev/null 2>&1
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout "${PKI}/leaf.key" -out "${PKI}/leaf.csr" -subj /CN=localhost >/dev/null 2>&1
+printf 'subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature\nbasicConstraints=CA:FALSE\n' \
+  >"${PKI}/leaf.ext"
+openssl x509 -req -in "${PKI}/leaf.csr" -CA "${PKI}/ca.pem" -CAkey "${PKI}/ca.key" \
+  -CAcreateserial -out "${PKI}/leaf.pem" -days 2 -extfile "${PKI}/leaf.ext" >/dev/null 2>&1
+
+# Start a one-connection s_server on the next free port; extra args follow.
+start_openssl_server() {
+  local log="$1"; shift
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    PORT=$((PORT + 1))
+    (sleep 20 | timeout 30 openssl s_server -accept "${PORT}" -tls1_3 \
+      -cert "${PKI}/leaf.pem" -key "${PKI}/leaf.key" -naccept 1 "$@") >"${log}" 2>&1 &
+    OPENSSL_PID=$!
+    local i
+    for i in $(seq 1 50); do
+      grep -q "^ACCEPT" "${log}" 2>/dev/null && return 0
+      kill -0 "${OPENSSL_PID}" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill "${OPENSSL_PID}" 2>/dev/null || true
+  done
+  echo "openssl s_server failed to start" >&2; cat "${log}" >&2; exit 1
+}
+
+# HelloRetryRequest, then a page over the retried connection.
+log="${WORK}/client-hrr.log"
+start_openssl_server "${WORK}/s_server-hrr.log" -groups P-256 -www
+timeout 30 "${CLIENT_BIN}" "${PORT}" "${PKI}/ca.pem" --p256-hrr >"${log}" 2>&1
+rc=$?
+wait "${OPENSSL_PID}" 2>/dev/null || true
+if [[ ${rc} -eq 0 ]] && grep -q '^NEGOTIATED retried=true' "${log}" \
+    && grep -q '^RESPONSE HTTP/1.0 200' "${log}"; then
+  note "PASS lean client HelloRetryRequest to openssl s_server ($(grep '^NEGOTIATED' "${log}"))"
+else
+  dump_case client-hrr "${log}"
+  fail "client-hrr: Lean client did not complete a retried handshake (rc=${rc})"
+fi
+
+# The same retried handshake, with OpenSSL exporting keying material server
+# side: equal bytes mean both ends derived the same exporter_master_secret over
+# message_hash || HelloRetryRequest || ClientHello2 || ... || server Finished.
+log="${WORK}/client-exporter.log"
+start_openssl_server "${WORK}/s_server-exporter.log" -groups P-256 \
+  -keymatexport EXPERIMENTAL-tls13-lean -keymatexportlen 32
+timeout 5 "${CLIENT_BIN}" "${PORT}" "${PKI}/ca.pem" --p256-hrr >"${log}" 2>&1
+kill "${OPENSSL_PID}" 2>/dev/null || true
+wait "${OPENSSL_PID}" 2>/dev/null || true
+client_hex="$(sed -n 's/^EXPORTER //p' "${log}")"
+server_hex="$(sed -n 's/^ *Keying material: //p' "${WORK}/s_server-exporter.log")"
+if [[ -n "${client_hex}" && "${client_hex^^}" == "${server_hex^^}" ]]; then
+  note "PASS lean client exporter after HelloRetryRequest matches openssl s_server (${server_hex})"
+else
+  dump_case client-exporter "${log}"
+  fail "client-exporter: keying material differs (lean=${client_hex:-none}, openssl=${server_hex:-none})"
+fi
 
 if [[ ${FAILURES} -ne 0 ]]; then
   echo "[interop] ${FAILURES} case(s) failed" >&2

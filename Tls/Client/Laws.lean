@@ -436,9 +436,146 @@ private theorem processHandshakeBuffer_write {state next : State} {wire : ByteAr
       | exact hbuf
 
 
+private theorem phase_eq_of_beq {p q : Phase} (h : (p == q) = true) : p = q := by
+  cases p <;> cases q <;> first | rfl | exact absurd h (by decide)
+
+/-- **Answering a HelloRetryRequest derives no keys**: both epochs, and the
+phase, are exactly what they were, and the phase is `waitingServerHello`. -/
+theorem acceptHelloRetryRequest_keys {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptHelloRetryRequest state message = .ok (next, wire)) :
+    state.phase = .waitingServerHello ∧ next.phase = state.phase ∧
+      next.readKeys? = state.readKeys? ∧ next.writeKeys? = state.writeKeys? ∧
+      next.handshakeSecret? = state.handshakeSecret? := by
+  unfold acceptHelloRetryRequest at h
+  simp only [pure_bind] at h
+  obtain ⟨hph, h⟩ := unless_ok h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  cases h
+  exact ⟨phase_eq_of_beq hph, rfl, rfl, rfl, rfl⟩
+
+private theorem liftHandshake_ok {α : Type} {r : Except String α} {v : α}
+    (h : liftHandshake r = .ok v) : r = .ok v := by
+  unfold liftHandshake at h
+  cases r with
+  | error e => cases h
+  | ok a => cases h; rfl
+
+private theorem checkHelloRetryRequest_ok {state : State}
+    {retry : Handshake.HelloRetryRequest}
+    (h : checkHelloRetryRequest state retry = .ok ()) :
+    state.retried = false ∧
+      state.offeredCipherSuites.contains retry.cipherSuite = true ∧
+      state.supportedGroups.contains retry.selectedGroup = true ∧
+      state.offeredKeyShareGroups.contains retry.selectedGroup = false := by
+  unfold checkHelloRetryRequest at h
+  obtain ⟨h1, h⟩ := if_throw_ok h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨h3, h⟩ := unless_ok h
+  obtain ⟨h4, h⟩ := unless_ok h
+  obtain ⟨h5, _⟩ := if_throw_ok h
+  exact ⟨h1, h3, h4, h5⟩
+
+/-- **The HelloRetryRequest transcript** (RFC 9846 §4.4.1): the first
+ClientHello is replaced by the synthetic `message_hash` message carrying its
+hash, then come the HelloRetryRequest and the second ClientHello, which is
+exactly the record the client sends. `acceptServerHello_keySchedule` binds
+`state.transcript ++ ServerHello`, so after a retry the handshake secrets bind
+`message_hash ‖ HelloRetryRequest ‖ ClientHello2 ‖ ServerHello`. -/
+theorem acceptHelloRetryRequest_transcript {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptHelloRetryRequest state message = .ok (next, wire)) :
+    ∃ messageHash secondHello : Handshake.Message,
+      Handshake.frame Handshake.messageHashType (HaclStar.sha256 state.transcript) =
+        .ok messageHash ∧
+      Record.encodePlaintext .handshake secondHello.encoded = .ok wire ∧
+      next.transcript = messageHash.encoded ++ message.encoded ++ secondHello.encoded := by
+  unfold acceptHelloRetryRequest at h
+  simp only [pure_bind] at h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨retry, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨secondHello, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨messageHash, hmh, h⟩ := except_bind_ok_inv h
+  obtain ⟨wireBytes, hw, h⟩ := except_bind_ok_inv h
+  cases h
+  exact ⟨messageHash, secondHello, liftHandshake_ok hmh, liftRecord_ok hw, rfl⟩
+
+/-- **A HelloRetryRequest is answered at most once, and only a legal one**
+(RFC 9846 §4.1.4): it selects a cipher suite the ClientHello offered and a
+group the ClientHello listed but sent no share for, so the retry changes the
+ClientHello. Afterwards those are the only suite and group offered, so
+`checkServerHello` rejects a ServerHello that disagrees with the retry, and the
+connection is marked as retried, so a second HelloRetryRequest is refused
+(`acceptHelloRetryRequest_retried`). -/
+theorem acceptHelloRetryRequest_offers {state next : State}
+    {message : Handshake.Message} {wire : ByteArray}
+    (h : acceptHelloRetryRequest state message = .ok (next, wire)) :
+    ∃ retry : Handshake.HelloRetryRequest,
+      Handshake.parseHelloRetryRequest message = .ok retry ∧
+      state.retried = false ∧ next.retried = true ∧
+      state.offeredCipherSuites.contains retry.cipherSuite = true ∧
+      state.supportedGroups.contains retry.selectedGroup = true ∧
+      state.offeredKeyShareGroups.contains retry.selectedGroup = false ∧
+      next.offeredCipherSuites = #[retry.cipherSuite] ∧
+      next.offeredKeyShareGroups = #[retry.selectedGroup] := by
+  unfold acceptHelloRetryRequest at h
+  simp only [pure_bind] at h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨retry, hp, h⟩ := except_bind_ok_inv h
+  obtain ⟨u, hc, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  cases h
+  obtain ⟨h1, h2, h3, h4⟩ := checkHelloRetryRequest_ok hc
+  exact ⟨retry, liftHandshake_ok hp, h1, rfl, h2, h3, h4, rfl, rfl⟩
+
+private theorem checkServerHello_ok {state : State} {hello : Handshake.ServerHello}
+    (h : checkServerHello state hello = .ok ()) :
+    state.offeredCipherSuites.contains hello.cipherSuite = true ∧
+      state.offeredKeyShareGroups.contains hello.selectedGroup = true := by
+  unfold checkServerHello at h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨h2, h⟩ := unless_ok h
+  obtain ⟨h3, _⟩ := unless_ok h
+  exact ⟨h2, h3⟩
+
+/-- **A ServerHello is accepted only for a suite and group on offer.** After a
+HelloRetryRequest those are exactly the retry's (`acceptHelloRetryRequest_offers`),
+so the ServerHello must agree with it, as RFC 9846 §4.1.4 requires. -/
+theorem acceptServerHello_offered {state next : State} {message : Handshake.Message}
+    (h : acceptServerHello state message = .ok next) :
+    ∃ hello : Handshake.ServerHello,
+      Handshake.parseServerHello message = .ok hello ∧
+      state.offeredCipherSuites.contains hello.cipherSuite = true ∧
+      state.offeredKeyShareGroups.contains hello.selectedGroup = true := by
+  unfold acceptServerHello at h
+  simp only [pure_bind] at h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨hello, hp, h⟩ := except_bind_ok_inv h
+  obtain ⟨u, hc, _⟩ := except_bind_ok_inv h
+  exact ⟨hello, liftHandshake_ok hp, checkServerHello_ok hc⟩
+
+/-- A connection that has answered one HelloRetryRequest answers no other. -/
+theorem acceptHelloRetryRequest_retried {state : State} {message : Handshake.Message}
+    (hr : state.retried = true) (out : State × ByteArray) :
+    acceptHelloRetryRequest state message ≠ .ok out := by
+  intro h
+  obtain ⟨_, _, hnot, -⟩ := acceptHelloRetryRequest_offers h
+  rw [hr] at hnot
+  cases hnot
+
 private theorem feedPlaintextHandshake_write {state next : State}
-    {fragment : ByteArray}
-    (h : feedPlaintextHandshake state fragment = .ok next) :
+    {fragment wire : ByteArray}
+    (h : feedPlaintextHandshake state fragment = .ok (next, wire)) :
     WriteEffect state next := by
   unfold feedPlaintextHandshake at h
   simp only [pure_bind] at h
@@ -446,8 +583,13 @@ private theorem feedPlaintextHandshake_write {state next : State}
   obtain ⟨framed, _, h⟩ := except_bind_ok_inv h
   split at h
   · split at h
-    · have hw := acceptServerHello_write h
-      exact hw
+    · split at h
+      · obtain ⟨-, -, -, hw, -⟩ := acceptHelloRetryRequest_keys h
+        show Record.Extends state.writeKeys? next.writeKeys?
+        rw [hw]; exact Record.Extends.refl _
+      · obtain ⟨stateS, hs, h⟩ := except_bind_ok_inv h
+        cases h
+        exact acceptServerHello_write hs
     · cases h
   · cases h; exact Record.Extends.refl _
 
@@ -507,7 +649,8 @@ private theorem processRecord_write {state next : State}
       | (obtain ⟨_, h⟩ := unless_ok h
          cases h
          exact Record.Extends.refl _)
-      | (obtain ⟨stateP, hfp, h⟩ := except_bind_ok_inv h
+      | (obtain ⟨pairP, hfp, h⟩ := except_bind_ok_inv h
+         obtain ⟨stateP, wireP⟩ := pairP
          cases h
          have hw := feedPlaintextHandshake_write hfp
          exact hw)
@@ -1006,8 +1149,8 @@ private theorem completeServerHandshake_wellFormed {state next : State}
     exact hgoal _ rfl rfl rfl rfl rfl rfl rfl
 
 private theorem feedPlaintextHandshake_wellFormed {state next : State}
-    {fragment : ByteArray}
-    (h : feedPlaintextHandshake state fragment = .ok next)
+    {fragment wire : ByteArray}
+    (h : feedPlaintextHandshake state fragment = .ok (next, wire))
     (hinv : state.WellFormed) : next.WellFormed := by
   unfold feedPlaintextHandshake at h
   simp only [pure_bind] at h
@@ -1015,7 +1158,15 @@ private theorem feedPlaintextHandshake_wellFormed {state next : State}
   obtain ⟨framed, _, h⟩ := except_bind_ok_inv h
   split at h
   · split at h
-    · exact acceptServerHello_wellFormed h
+    · split at h
+      · obtain ⟨hs, hp, hr, hw, -⟩ := acceptHelloRetryRequest_keys h
+        have hph : state.phase = .waitingServerHello := hs
+        refine ⟨fun hc => ?_, fun _ => ?_⟩
+        · rw [hp] at hc; rw [hc] at hs; cases hs
+        · rw [hr, hw]; exact hinv.2 hph
+      · obtain ⟨stateS, hs, h⟩ := except_bind_ok_inv h
+        cases h
+        exact acceptServerHello_wellFormed hs
     · cases h
   · cases h
     exact hinv
@@ -1138,7 +1289,8 @@ private theorem processRecord_wellFormed {state next : State}
       | (obtain ⟨_, h⟩ := unless_ok h
          cases h
          exact hinv)
-      | (obtain ⟨stateP, hfp, h⟩ := except_bind_ok_inv h
+      | (obtain ⟨pairP, hfp, h⟩ := except_bind_ok_inv h
+         obtain ⟨stateP, wireP⟩ := pairP
          cases h
          exact feedPlaintextHandshake_wellFormed hfp hinv)
       | (obtain ⟨_, h⟩ := unless_ok h
@@ -1226,9 +1378,6 @@ theorem run_wellFormed {ops : List Op} : ∀ {state : State} {out : Output},
 The conjuncts of `State.WellFormed` are the facts that survive every step. These
 are the facts about *individual* transitions: what must have been checked for a
 step to be taken at all. -/
-
-private theorem phase_eq_of_beq {p q : Phase} (h : (p == q) = true) : p = q := by
-  cases p <;> cases q <;> first | rfl | exact absurd h (by decide)
 
 /-- **Application data is protected only by an established connection whose
 local write direction is open.** A peer `close_notify` does not close this
@@ -2866,8 +3015,8 @@ private theorem processHandshakeBuffer_epochs {H : Spec.Hkdf} (hi : Implements H
       | exact hbuf
 
 private theorem feedPlaintextHandshake_epochs {H : Spec.Hkdf} (hi : Implements H)
-    {state next : State} {fragment : ByteArray}
-    (h : feedPlaintextHandshake state fragment = .ok next)
+    {state next : State} {fragment wire : ByteArray}
+    (h : feedPlaintextHandshake state fragment = .ok (next, wire))
     (hinv : state.WellFormed) : SpecEffect H state next := by
   unfold feedPlaintextHandshake at h
   simp only [pure_bind] at h
@@ -2875,9 +3024,16 @@ private theorem feedPlaintextHandshake_epochs {H : Spec.Hkdf} (hi : Implements H
   obtain ⟨framed, _, h⟩ := except_bind_ok_inv h
   split at h
   · split at h
-    · have hw := acceptServerHello_epochs hi h
-        (wellFormed_transfer hinv rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
-      exact SpecEffect.of_eq hw rfl rfl
+    · split at h
+      · obtain ⟨-, hp, -, hw, -⟩ := acceptHelloRetryRequest_keys h
+        refine SpecEffect.within (by rw [hp]) ?_
+        show Record.WithinEpoch H state.writeKeys? next.writeKeys?
+        rw [hw]; exact Record.WithinEpoch.refl _
+      · obtain ⟨stateS, hs, h⟩ := except_bind_ok_inv h
+        cases h
+        have hw := acceptServerHello_epochs hi hs
+          (wellFormed_transfer hinv rfl (.inl rfl) (.inl rfl) rfl rfl rfl rfl)
+        exact SpecEffect.of_eq hw rfl rfl
     · cases h
   · cases h; exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
 
@@ -2943,7 +3099,8 @@ private theorem processRecord_epochs {H : Spec.Hkdf} (hi : Implements H)
       | (obtain ⟨_, h⟩ := unless_ok h
          cases h
          exact SpecEffect.within rfl (Record.WithinEpoch.refl _))
-      | (obtain ⟨stateP, hfp, h⟩ := except_bind_ok_inv h
+      | (obtain ⟨pairP, hfp, h⟩ := except_bind_ok_inv h
+         obtain ⟨stateP, wireP⟩ := pairP
          cases h
          have hw := feedPlaintextHandshake_epochs hi hfp hinv
          exact hw)

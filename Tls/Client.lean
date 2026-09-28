@@ -45,6 +45,11 @@ structure Config where
   present, the ClientHello sends both X25519 and P-256 shares so pre-18
   PostgreSQL defaults need no HRR. -/
   p256Private : Option ByteArray := none
+  /-- With `p256Private`, send the P-256 key share in the first ClientHello.
+  When false, P-256 is only listed in supported_groups: a server that prefers
+  it asks for the share with a HelloRetryRequest, and the second ClientHello
+  carries it (RFC 9846 §4.1.4). -/
+  p256FirstFlightShare : Bool := true
   legacySessionId : ByteArray := ByteArray.empty
   serverName : Option String := none
   /-- ALPN protocols to offer, in preference order (empty omits ALPN). -/
@@ -104,6 +109,7 @@ inductive Error where
   | trailingHandshakeAfterFinished
   | notConnected (phase : Phase)
   | connectionClosed
+  | unsupportedExtension (extensionType : UInt16)
   | invalidExporterRequest (message : String)
   | internalState (message : String)
   deriving Repr, Inhabited
@@ -151,6 +157,8 @@ def render : Error → String
   | .notConnected phase =>
       s!"TLS connection is not ready for application data (waiting for {phase.render})"
   | .connectionClosed => "TLS connection is closed"
+  | .unsupportedExtension extensionType =>
+      s!"TLS server sent extension {extensionType} the client did not offer"
   | .invalidExporterRequest message => s!"TLS exporter: {message}"
   | .internalState message => s!"invalid internal TLS client state: {message}"
 
@@ -171,6 +179,7 @@ def fatalAlertDescription? : Error → Option UInt8
   | .invalidAlertLength 0 => some 10
   | .invalidAlertLength _ => some 50
   | .keyExchangeFailed => some 47
+  | .unsupportedExtension _ => some 110
   | _ => none
 
 end Error
@@ -199,8 +208,16 @@ structure State where
   ServerHello selection is checked against this list rather than against a
   hard-coded singleton, so adding suites does not weaken negotiation checks. -/
   offeredCipherSuites : Array UInt16 := #[]
-  /-- Key-share groups actually sent in this connection's ClientHello. -/
+  /-- Key-share groups actually sent in this connection's ClientHello. After a
+  HelloRetryRequest, exactly the group it selected. -/
   offeredKeyShareGroups : Array Handshake.NamedGroup := #[]
+  /-- Groups listed in this connection's supported_groups. -/
+  supportedGroups : Array Handshake.NamedGroup := #[]
+  /-- The ClientHello's public parameters, kept to build the second ClientHello
+  a HelloRetryRequest asks for. -/
+  helloConfig : Handshake.ClientHelloConfig := default
+  /-- A HelloRetryRequest has been answered; RFC 9846 §4.1.4 forbids a second. -/
+  retried : Bool := false
   /-- ALPN protocol IDs advertised by this connection's ClientHello. -/
   offeredAlpnProtocols : Array String := #[]
   identity : Option Identity := none
@@ -400,14 +417,16 @@ def start (config : Config) : Except Error Output := do
       unless publicKey.size == 65 && publicKey.get! 0 == 4 do
         throw (.internalState "P-256 returned a malformed public key")
       pure (some publicKey)
-  let hello ← liftHandshake <| Handshake.encodeClientHello {
+  let helloConfig : Handshake.ClientHelloConfig := {
     random := config.clientRandom
     x25519PublicKey := publicKey
-    p256PublicKey
+    p256PublicKey := if config.p256FirstFlightShare then p256PublicKey else none
     serverName := config.serverName
     legacySessionId := config.legacySessionId
     alpnProtocols := config.alpnProtocols
+    offerP256 := p256PublicKey.isSome
   }
+  let hello ← liftHandshake <| Handshake.encodeClientHello helloConfig
   let wireBytes ← liftRecord <| Record.encodePlaintext .handshake hello.encoded
   let state : State := {
     phase := .waitingServerHello
@@ -417,10 +436,13 @@ def start (config : Config) : Except Error Output := do
     legacySessionId := config.legacySessionId
     offeredCipherSuites := #[Handshake.tlsChaCha20Poly1305Sha256]
     offeredKeyShareGroups :=
-      if config.p256Private.isSome then
+      if config.p256Private.isSome && config.p256FirstFlightShare then
         #[.x25519, .secp256r1]
       else
         #[.x25519]
+    supportedGroups :=
+      if config.p256Private.isSome then #[.x25519, .secp256r1] else #[.x25519]
+    helloConfig
     offeredAlpnProtocols := config.alpnProtocols
     identity := config.identity
     peerAuth := config.peerAuth
@@ -494,16 +516,100 @@ def acceptServerHello (state : State) (message : Handshake.Message) :
     writeKeys? := some writeKeys
   }
 
+/-- The RFC 9846 §4.1.4 checks on a HelloRetryRequest that touch no state: at
+most one per connection; the session id echoed; a cipher suite this ClientHello
+offered; a group it listed but sent no share for (so the retry changes the
+ClientHello); and no extension beyond supported_versions, key_share and a
+well-formed cookie. -/
+private def checkHelloRetryRequest (state : State)
+    (retry : Handshake.HelloRetryRequest) : Except Error Unit := do
+  if state.retried then
+    throw (.unexpectedHandshake .waitingServerHello Handshake.serverHelloType)
+  unless retry.legacySessionIdEcho == state.legacySessionId do
+    throw (.illegalParameter
+      "HelloRetryRequest legacy_session_id_echo does not match ClientHello")
+  unless state.offeredCipherSuites.contains retry.cipherSuite do
+    throw (.illegalParameter
+      s!"HelloRetryRequest selected cipher suite {retry.cipherSuite} that the client did not offer")
+  unless state.supportedGroups.contains retry.selectedGroup do
+    throw (.illegalParameter
+      s!"HelloRetryRequest selected group {retry.selectedGroup.toUInt16} the client did not list")
+  if state.offeredKeyShareGroups.contains retry.selectedGroup then
+    throw (.illegalParameter
+      s!"HelloRetryRequest selected group {retry.selectedGroup.toUInt16}, \
+        which the ClientHello already carried a share for")
+  for extension in retry.extensions do
+    let t := extension.extensionType
+    unless t == Handshake.supportedVersionsExtension || t == Handshake.keyShareExtension
+        || t == Handshake.cookieExtension do
+      throw (.unsupportedExtension t)
+    if t == Handshake.cookieExtension then
+      -- struct { opaque cookie<1..2^16-1>; }
+      let body := extension.data
+      unless body.size ≥ 3 &&
+          (body.get! 0).toNat * 256 + (body.get! 1).toNat + 2 == body.size do
+        throw (.handshakeCodec "malformed HelloRetryRequest cookie")
+
+/-- The P-256 share for a second ClientHello, when the HelloRetryRequest
+selected P-256; `checkHelloRetryRequest` has already required that no P-256
+share was sent, so this key's public value is new on the wire. -/
+private def retryP256PublicKey (state : State) :
+    Handshake.NamedGroup → Except Error (Option ByteArray)
+  | .x25519 => pure none
+  | .secp256r1 => do
+    let some privateKey := state.p256Private
+      | throw (.illegalParameter "HelloRetryRequest selected P-256 without a client key")
+    let some publicKey := HaclStar.P256.publicKey privateKey
+      | throw (.invalidPrivateKey .secp256r1)
+    pure (some publicKey)
+
+/-- Answer a HelloRetryRequest (RFC 9846 §4.1.4): send a second ClientHello
+that is the first with a single key share for the selected group and the
+cookie echoed, and replace the first ClientHello in the transcript with its
+synthetic `message_hash`. No keys are derived. The ServerHello that follows
+must select this cipher suite and this group, which `checkServerHello` then
+enforces, because they become the only ones offered. -/
+def acceptHelloRetryRequest (state : State) (message : Handshake.Message) :
+    Except Error (State × ByteArray) := do
+  unless state.phase == .waitingServerHello do
+    throw (.unexpectedHandshake state.phase message.msgType)
+  let retry ← liftHandshake (Handshake.parseHelloRetryRequest message)
+  checkHelloRetryRequest state retry
+  let p256PublicKey ← retryP256PublicKey state retry.selectedGroup
+  let cookie := (retry.extensions.find?
+    (·.extensionType == Handshake.cookieExtension)).map (·.data)
+  let secondHello ← liftHandshake <| Handshake.encodeClientHello {
+    state.helloConfig with
+    sendX25519Share := retry.selectedGroup == .x25519
+    p256PublicKey
+    cookie
+  }
+  let messageHash ← liftHandshake
+    (Handshake.frame Handshake.messageHashType (HaclStar.sha256 state.transcript))
+  let wireBytes ← liftRecord (Record.encodePlaintext .handshake secondHello.encoded)
+  pure ({
+    state with
+    handshakeBuffered := ByteArray.empty
+    transcript := messageHash.encoded ++ message.encoded ++ secondHello.encoded
+    offeredCipherSuites := #[retry.cipherSuite]
+    offeredKeyShareGroups := #[retry.selectedGroup]
+    retried := true
+  }, wireBytes)
+
 private def feedPlaintextHandshake (state : State) (fragment : ByteArray) :
-    Except Error State := do
+    Except Error (State × ByteArray) := do
   if fragment.isEmpty then
     throw (.unexpectedRecord state.phase .handshake)
   let buffered := state.handshakeBuffered ++ fragment
   let some (message, rest) ← takeHandshake? buffered
-    | pure { state with handshakeBuffered := buffered }
+    | pure ({ state with handshakeBuffered := buffered }, ByteArray.empty)
   unless rest.isEmpty do
     throw (.unexpectedHandshake .waitingServerHello (rest.get! 0))
-  acceptServerHello { state with handshakeBuffered := ByteArray.empty } message
+  if Handshake.isHelloRetryRequest message then
+    acceptHelloRetryRequest { state with handshakeBuffered := ByteArray.empty } message
+  else
+    let state ← acceptServerHello { state with handshakeBuffered := ByteArray.empty } message
+    pure (state, ByteArray.empty)
 
 private def appendTranscript (state : State) (message : Handshake.Message) : State :=
   { state with transcript := state.transcript ++ message.encoded }
@@ -964,8 +1070,8 @@ private def processRecord (state : State) (record : Record.RawRecord) :
   | .waitingServerHello =>
       match record.contentType with
       | .handshake =>
-          let state ← feedPlaintextHandshake state record.fragment
-          pure (state, ByteArray.empty, ByteArray.empty)
+          let (state, wireBytes) ← feedPlaintextHandshake state record.fragment
+          pure (state, ByteArray.empty, wireBytes)
       | .changeCipherSpec =>
           unless validCompatibilityChangeCipherSpec record.fragment do
             throw .invalidCompatibilityChangeCipherSpec

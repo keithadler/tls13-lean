@@ -362,9 +362,18 @@ Implemented and negotiated:
   require server trust and hostname verification **before** their disclosure.
   See [workload identity](docs/workload-identity.md) for policy and lifecycle.
 - **Extensions**: server_name, supported_groups, signature_algorithms, ALPN,
-  supported_versions, key_share; the server performs HelloRetryRequest with
-  the synthetic `message_hash` transcript and strict second-ClientHello
-  checks.
+  supported_versions, key_share, cookie; the server performs
+  HelloRetryRequest with the synthetic `message_hash` transcript and strict
+  second-ClientHello checks.
+- **Client HelloRetryRequest** (RFC 9846 §4.1.4): with
+  `p256FirstFlightShare := false` the client lists P-256 without a first-flight
+  share. It answers one legal retry with a second ClientHello carrying only the
+  selected group's share and the cookie echoed, and rebuilds the transcript as
+  `message_hash ‖ HelloRetryRequest ‖ ClientHello2`
+  (`Tls.Client.acceptHelloRetryRequest_transcript`). It refuses a second retry,
+  a group already shared or not listed, an unoffered suite or extension, and a
+  ServerHello that disagrees with the retry (`acceptHelloRetryRequest_offers`,
+  `acceptServerHello_offered`).
 - **Post-handshake core**: both roles receive KeyUpdate, advance the read
   epoch, and, while the local write side remains open, answer
   `update_requested` under the old write epoch before advancing it. Responses
@@ -390,7 +399,7 @@ Unsupported: PSK and session resumption
 (NewSessionTicket is silently ignored without semantically parsing its body;
 the server never issues tickets),
 0-RTT, the early exporter and resumption secrets, post-handshake client authentication,
-AES-GCM suites, client-side HelloRetryRequest processing, and post-quantum
+AES-GCM suites, and post-quantum
 hybrid groups (a hybrid key share in a
 ClientHello is tolerated and skipped, not negotiated). The server's
 *negotiated* surface stays deliberately narrow (ChaCha20-Poly1305 +
@@ -544,7 +553,7 @@ test binary is built, so a violation is a red target, not a stale README:
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
 | `//TLS13:tls13_assurance` | 25 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Main (compatibility theorem identifier `masterSecret_spec`)/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies`, and `Chain.validate_leaf_keyUsage` |
-| `//Tls:tls_assurance` | 92 principal theorems — finite write traces (`WriteRun.nodup`, `AeadWriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, the schedule-refined `run_nonce_trace_spec`/`start_run_nonce_trace_spec`, `run_epochs`, and nonce/sequence injectivity), record conservation, the exact `TLSInnerPlaintext` bound, and seal/open inversion; ClientHello canonicity and body injectivity; the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary); and the state-machine transition and invariant laws, including KeyUpdate limit/error behavior, no output after local closure, directional peer closure, both directions of the connected-only application-data rule, and both engines' no-epoch-before-the-first-flight clauses |
+| `//Tls:tls_assurance` | 97 principal theorems — finite write traces (`WriteRun.nodup`, `AeadWriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, the schedule-refined `run_nonce_trace_spec`/`start_run_nonce_trace_spec`, `run_epochs`, and nonce/sequence injectivity), record conservation, the exact `TLSInnerPlaintext` bound, and seal/open inversion; ClientHello canonicity and body injectivity; the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary); and the state-machine transition and invariant laws, including KeyUpdate limit/error behavior, no output after local closure, directional peer closure, both directions of the connected-only application-data rule, and both engines' no-epoch-before-the-first-flight clauses |
 
 Each target also scans every constant of the full 28-module first-party closure
 (`HaclStar`, `TLS13`, `Tls`): nothing may reach
@@ -565,6 +574,7 @@ audits above:
 | --- | --- |
 | `hacl_kat_test` | Coverage for every binding, using published vectors where available: SHA-2 (FIPS 180), HMAC (RFC 4231), HKDF (RFC 5869), X25519 (RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) + tamper detection, Ed25519 (RFC 8032), ECDSA roundtrip, and broad RFC 8448 key-schedule checkpoints plus a hand-encoded `HkdfLabel`; it also exercises HKDF's expansion ceiling and rejects malformed X25519/AEAD dimensions at the FFI boundary |
 | `tls_handshake_test` | Wire codecs against a GREASE-laden, fragmented, reordered ClientHello; record reassembly across TCP boundaries; missing-extension and duplicate-extension alerts; the full HelloRetryRequest flow |
+| `tls_client_retry_test` | Client HelloRetryRequest: the one-share second ClientHello, cookie echo, the `message_hash` transcript, the server's own §4.1.2 retry check on it, the ServerHello that must match, and seven refusals with their alerts |
 | `tls_record_test` | RFC 9846's exact `TLSInnerPlaintext` boundary for both seal and open, plus rejection one byte above it |
 | `tls_server_interop_test` | Authenticated handshake between this repo's client and server engines (no sockets): negotiation, sender-side leaf policy, three-record server flight, application data both ways, 50-certificate fragmentation, KeyUpdate ordering/limits/errors (including crossing requests after local close), unsupported-ticket handling, alert classification, and directional closure behavior |
 | `x509_der_test`, `x509_certificate_test`, `x509_chain_test`, `x509_signature_test`, `x509_hostname_test`, `x509_channel_binding_test` | DER/PEM strictness corpus; OpenSSL-generated RSA/P-256/Ed25519 fixtures; chain validation success and eleven exercised failure classes (including leaf `digitalSignature` KeyUsage); RSA/ECDSA/PSS signature vectors and boundary rejections; hostname and channel-binding rules |
@@ -589,7 +599,11 @@ HTTP/1.1 200 body:
   {X25519MLKEM768, P-256}, so the server must retry to P-256);
 - RFC 9846 §7.5 exported keying material: OpenSSL (`-keymatexport`) and Go
   (`ExportKeyingMaterial`) must each export exactly the bytes the server
-  exports for the same label.
+  exports for the same label;
+- the Lean *client* (`tls_external_client`) against OpenSSL `s_server
+  -groups P-256`, with a per-run CA and P-256 leaf: the server must send a
+  HelloRetryRequest, the retried handshake must fetch a page, and the client's
+  export must equal the one `s_server` prints.
 
 The gate is tagged `manual`/`local` — it binds loopback ports and shells
 out to host `openssl` and `curl` (the Go cases skip gracefully without a
