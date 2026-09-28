@@ -1036,7 +1036,7 @@ private theorem answerCertificateRequest_buffered {state next : State}
     (h : answerCertificateRequest state message = .ok (next, wireBytes)) :
     next.handshakeBuffered = state.handshakeBuffered := by
   unfold answerCertificateRequest at h
-  simp only [pure_bind, bind, Except.bind] at h
+  simp only [bind, Except.bind] at h
   repeat' first | (split at h) | (cases h)
   all_goals first | rfl | (split <;> rfl)
 
