@@ -350,8 +350,14 @@ Implemented and negotiated:
   suite whose every primitive is portable scalar C in HACL\* (no per-CPU
   assembly), so the build is identical on x86-64 and arm64.
 - **Key exchange**: X25519 preferred; P-256 available when configured.
-- **Server authentication**: Ed25519 (the server signs CertificateVerify
-  with a raw Ed25519 key). Clients accept CertificateVerify signatures with
+- **Server authentication**: Ed25519, or ECDSA P-256 with SHA-256
+  (`signingAlgorithm := .ecdsaP256Sha256`), the `ecdsa_secp256r1_sha256`
+  scheme RFC 9846 §9.1 makes mandatory. ECDSA nonces are deterministic
+  (RFC 6979, in pure Lean over the existing HMAC-SHA256 binding, checked
+  against RFC 6979 A.2.5), so signing needs no entropy from the caller, and
+  `checkConfig` requires the P-256 key to be the leaf's. Clients without
+  Ed25519, such as LibreSSL-based ones, can now authenticate the server.
+  Clients accept CertificateVerify signatures with
   `ecdsa_secp256r1_sha256`, `ed25519`, `rsa_pss_rsae_sha256`, and
   `rsa_pss_pss_sha256`; PKCS#1 v1.5 is advertised for certificate-*chain*
   selection only, as RFC 9846 requires.
@@ -575,7 +581,7 @@ audits above:
 
 | Target | Coverage |
 | --- | --- |
-| `hacl_kat_test` | Coverage for every binding, using published vectors where available: SHA-2 (FIPS 180), HMAC (RFC 4231), HKDF (RFC 5869), X25519 (RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) + tamper detection, Ed25519 (RFC 8032), ECDSA roundtrip, and broad RFC 8448 key-schedule checkpoints plus a hand-encoded `HkdfLabel`; it also exercises HKDF's expansion ceiling and rejects malformed X25519/AEAD dimensions at the FFI boundary |
+| `hacl_kat_test` | Coverage for every binding, using published vectors where available: SHA-2 (FIPS 180), HMAC (RFC 4231), HKDF (RFC 5869), X25519 (RFC 7748), P-256 ECDH (RFC 5903), ChaCha20-Poly1305 (RFC 8439) + tamper detection, Ed25519 (RFC 8032), ECDSA roundtrip, RFC 6979 A.2.5 deterministic P-256 nonces and signatures through the DER encoder, and broad RFC 8448 key-schedule checkpoints plus a hand-encoded `HkdfLabel`; it also exercises HKDF's expansion ceiling and rejects malformed X25519/AEAD dimensions at the FFI boundary |
 | `tls_handshake_test` | Wire codecs against a GREASE-laden, fragmented, reordered ClientHello; record reassembly across TCP boundaries; missing-extension and duplicate-extension alerts; the full HelloRetryRequest flow |
 | `tls_client_retry_test` | Client HelloRetryRequest: the one-share second ClientHello, cookie echo, the `message_hash` transcript, the server's own §4.1.2 retry check on it, the ServerHello that must match, and seven refusals with their alerts |
 | `tls_record_test` | RFC 9846's exact `TLSInnerPlaintext` boundary for both seal and open, plus rejection one byte above it |

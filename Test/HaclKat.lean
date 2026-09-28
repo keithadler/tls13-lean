@@ -7,6 +7,7 @@ import HaclStar.Signature
 import HaclStar.Aead
 import HaclStar.Hex
 import TLS13.KeySchedule
+import TLS13.Rfc6979
 
 /-!
 Known-answer tests for the HACL* bindings and the TLS 1.3 key schedule, against
@@ -328,5 +329,34 @@ def main : IO Unit := do
     throw (IO.userError "ecdsa-p256-sign: accepted a short private key")
   unless (Signature.ecdsaP256Sha256Sign ecPriv ecMsg ByteArray.empty).isNone do
     throw (IO.userError "ecdsa-p256-sign: accepted a short nonce")
+
+  -- RFC 6979 A.2.5: deterministic ECDSA, P-256 with SHA-256. The key's public
+  -- point, the derived nonce k, and the signature (r, s) for "sample" and
+  -- "test"; then the DER encoding round-trips through the X.509 parser.
+  let x6979 := h "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721"
+  match P256.publicKey x6979 with
+  | some point =>
+      check "rfc6979-p256-public" point
+        ("04" ++ "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6" ++
+          "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299")
+  | none => throw (IO.userError "rfc6979: public key rejected")
+  for (message, k, r, s) in [
+      ("sample",
+        "a6e3c57dd01abe90086538398355dd4c3b17aa873382b0f24d6129493d8aad60",
+        "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716",
+        "f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8"),
+      ("test",
+        "d16b6ae827f17175e040871a1c7ec3500192c4c92677336ec2537acaee0008e0",
+        "f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367",
+        "019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083")] do
+    check s!"rfc6979-p256-k-{message}"
+      (TLS13.Rfc6979.nonceP256Sha256 x6979 message.toUTF8) k
+    let some der := TLS13.Rfc6979.signP256 x6979 message.toUTF8
+      | throw (IO.userError s!"rfc6979 {message}: signing failed")
+    match TLS13.X509.Signature.parseECDSAP256Signature der with
+    | .ok (rr, ss) =>
+        check s!"rfc6979-p256-r-{message}" rr r
+        check s!"rfc6979-p256-s-{message}" ss s
+    | .error e => throw (IO.userError s!"rfc6979 {message}: DER did not parse: {e}")
 
   IO.println "all HACL* KAT assertions passed"

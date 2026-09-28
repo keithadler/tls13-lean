@@ -283,6 +283,16 @@ else
   note "SKIP go crypto/tls cases: no go binary on PATH"
 fi
 
+# ECDSA P-256 server authentication (RFC 9846 §9.1): OpenSSL is allowed only
+# ecdsa_secp256r1_sha256 and must verify the server's RFC 6979 signature
+# against the P-256 fixture.
+export TLS13_TEST_SERVER_ECDSA=1
+if run_openssl openssl-ecdsa -sigalgs ECDSA+SHA256 \
+    -CAfile "${SERVER_CWD}/Test/Fixtures/Tls/ecdsa_server_cert.pem"; then
+  note "PASS openssl ecdsa_secp256r1_sha256 server signature"
+fi
+unset TLS13_TEST_SERVER_ECDSA
+
 # Independent client authentication: OpenSSL constructs CertificateVerify and
 # Finished; the Lean server checks purpose, chain and proof of possession.
 export TLS13_TEST_CLIENT_CA="${SERVER_CWD}/Test/Fixtures/Identity/root.pem"

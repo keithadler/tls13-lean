@@ -10,6 +10,7 @@ public import Tls.Identity
 public import Tls.Record
 public import TLS13.KeySchedule
 public import TLS13.X509
+public import TLS13.Rfc6979
 
 public section
 
@@ -49,6 +50,31 @@ structure ClientAuthPolicy where
   maximumCertificates : Nat := 10
   deriving Inhabited
 
+/-- The algorithm the server's CertificateVerify is signed with. -/
+inductive SigningAlgorithm where
+  /-- RFC 8032 Ed25519 (`ed25519`, 0x0807). -/
+  | ed25519
+  /-- ECDSA P-256 with SHA-256 (`ecdsa_secp256r1_sha256`, 0x0403), which
+  RFC 9846 §9.1 makes mandatory to support; nonces per RFC 6979. -/
+  | ecdsaP256Sha256
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- The TLS SignatureScheme code point. -/
+def SigningAlgorithm.scheme : SigningAlgorithm → UInt16
+  | .ed25519 => Handshake.ed25519
+  | .ecdsaP256Sha256 => Handshake.ecdsaSecp256r1Sha256
+
+/-- The algorithm's name in messages. -/
+def SigningAlgorithm.name : SigningAlgorithm → String
+  | .ed25519 => "Ed25519"
+  | .ecdsaP256Sha256 => "ECDSA P-256"
+
+/-- The X.509 view of the scheme, for checking the leaf's public key. -/
+def SigningAlgorithm.certificateVerifyScheme :
+    SigningAlgorithm → TLS13.X509.Signature.CertificateVerifyScheme
+  | .ed25519 => .ed25519
+  | .ecdsaP256Sha256 => .ecdsaSecp256r1Sha256
+
 structure Config where
   serverRandom : ByteArray
   x25519Private : ByteArray
@@ -56,10 +82,12 @@ structure Config where
   p256Private : Option ByteArray := none
   /-- DER certificates, leaf first. -/
   certificateChain : Array ByteArray
-  /-- Ed25519 private scalar matching the leaf certificate's public key. The
-  leaf must itself carry an Ed25519 SPKI and, when KeyUsage is present, permit
-  `digitalSignature`; `checkConfig` verifies those public certificate fields. -/
+  /-- The 32-byte private scalar matching the leaf certificate's public key,
+  for `signingAlgorithm`. The leaf must carry a matching SPKI and, when
+  KeyUsage is present, permit `digitalSignature`; `checkConfig` verifies those
+  public certificate fields, and for P-256 that the key is the leaf's. -/
   signingKey : ByteArray
+  signingAlgorithm : SigningAlgorithm := .ed25519
   /-- ALPN protocols the server supports, in server preference order. The first
   one the client also offers is selected. Empty disables ALPN. -/
   alpnProtocols : List String := []
@@ -132,7 +160,7 @@ def render : Error → String
   | .noSupportedGroup =>
       "client offered no mutually supported group (need X25519 or configured P-256)"
   | .noSupportedSignatureScheme =>
-      "client offered no signature scheme usable with the server Ed25519 key"
+      "client offered no signature scheme usable with the server's key"
   | .invalidClientKeyShare group message =>
       s!"invalid client {repr group} key share: {message}"
   | .invalidRetryClientHello message =>
@@ -197,6 +225,7 @@ structure State where
   p256Private : Option ByteArray := none
   certificateChain : Array ByteArray := #[]
   signingKey : ByteArray
+  signingAlgorithm : SigningAlgorithm := .ed25519
   alpnProtocols : List String := []
   clientAuth : Option ClientAuthPolicy := none
   clientCertificateReceived : Bool := false
@@ -361,6 +390,7 @@ def start (config : Config) : State :=
     p256Private := config.p256Private
     certificateChain := config.certificateChain
     signingKey := config.signingKey
+    signingAlgorithm := config.signingAlgorithm
     alpnProtocols := config.alpnProtocols
     clientAuth := config.clientAuth
   }
@@ -463,7 +493,8 @@ private def psksAreOrderedSubset (subset superset : Array (ByteArray × Nat)) :
       return false
   return true
 
-private def checkCommonOffers (hello : Handshake.ClientHello) : Except Error Unit := do
+private def checkCommonOffers (hello : Handshake.ClientHello) (scheme : UInt16) :
+    Except Error Unit := do
   unless hello.offersTls13 do
     throw .clientDidNotOfferTls13
   let hasExtension (extensionType : UInt16) : Bool :=
@@ -477,7 +508,7 @@ private def checkCommonOffers (hello : Handshake.ClientHello) : Except Error Uni
     throw (.missingRequiredExtension Handshake.signatureAlgorithmsExtension)
   unless hello.cipherSuites.contains Handshake.tlsChaCha20Poly1305Sha256 do
     throw .noSupportedCipherSuite
-  unless hello.signatureAlgorithms.contains Handshake.ed25519 do
+  unless hello.signatureAlgorithms.contains scheme do
     throw .noSupportedSignatureScheme
   let _ ← liftHandshake (parseOfferedPsks hello)
 
@@ -580,12 +611,28 @@ private def checkConfig (state : State) : Except Error Unit := do
   unless TLS13.X509.Chain.permitsPurpose leaf .serverAuth do
     throw (.invalidConfig "leaf certificate purpose does not permit server authentication")
   unless TLS13.X509.Signature.certificateVerifySchemeCompatible
-      .ed25519 leaf.tbsCertificate.subjectPublicKeyInfo do
+      state.signingAlgorithm.certificateVerifyScheme
+      leaf.tbsCertificate.subjectPublicKeyInfo do
     throw (.invalidConfig
-      "leaf certificate public key is not compatible with Ed25519 CertificateVerify")
+      s!"leaf certificate public key is not compatible with {state.signingAlgorithm.name} CertificateVerify")
   unless state.signingKey.size == 32 do
     throw (.invalidConfig
-      s!"Ed25519 signing key must be 32 bytes, got {state.signingKey.size}")
+      s!"signing key must be 32 bytes, got {state.signingKey.size}")
+  if state.signingAlgorithm == .ecdsaP256Sha256 then
+    unless (match leaf.tbsCertificate.subjectPublicKeyInfo.key with
+        | .p256 point => HaclStar.P256.publicKey state.signingKey == some point
+        | _ => false) do
+      throw (.invalidConfig "P-256 signing key does not match the leaf certificate")
+
+/-- The server CertificateVerify signature, or empty if signing failed: a
+64-byte Ed25519 signature, or a DER ECDSA-Sig-Value with an RFC 6979 nonce. -/
+private def certificateVerifySignature (algorithm : SigningAlgorithm)
+    (key content : ByteArray) : ByteArray :=
+  match algorithm with
+  | .ed25519 =>
+    let signature := HaclStar.Signature.ed25519Sign key content
+    if signature.size == 64 then signature else ByteArray.empty
+  | .ecdsaP256Sha256 => (TLS13.Rfc6979.signP256 key content).getD ByteArray.empty
 
 /-- Choose the first server-preferred ALPN protocol the client also offered. -/
 private def selectAlpn (serverProtocols : List String) (clientProtocols : Array String) :
@@ -639,11 +686,12 @@ def completeClientHello (state : State) (hello : Handshake.ClientHello)
     match TLS13.X509.Signature.serverCertificateVerifyContent (HaclStar.sha256 transcript) with
     | .ok content => pure content
     | .error message => throw (.internalState message)
-  let signature := HaclStar.Signature.ed25519Sign state.signingKey certVerifyContent
-  unless signature.size == 64 do
+  let signature := certificateVerifySignature state.signingAlgorithm state.signingKey
+    certVerifyContent
+  unless !signature.isEmpty do
     throw .signingFailed
   let certVerify ← liftHandshake
-    (Handshake.encodeCertificateVerify Handshake.ed25519 signature)
+    (Handshake.encodeCertificateVerify state.signingAlgorithm.scheme signature)
   let transcript := transcript ++ certVerify.encoded
 
   -- Server Finished.
@@ -742,7 +790,7 @@ private def acceptClientHello (state : State) (message : Handshake.Message) :
     Except Error (State × ByteArray) := do
   let hello ← liftHandshake (Handshake.parseClientHello message)
   checkConfig state
-  checkCommonOffers hello
+  checkCommonOffers hello state.signingAlgorithm.scheme
   match state.phase with
   | .waitingClientHello =>
       let group ← selectGroup state hello

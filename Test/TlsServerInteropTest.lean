@@ -266,6 +266,41 @@ private def checkUpdateKeys (clientBefore client : Client.State)
   | .error .connectionClosed => pure ()
   | _ => throw (IO.userError "client updated keys after close_notify")
 
+/-- A server that signs its CertificateVerify with ECDSA P-256 (RFC 9846 §9.1's
+mandatory `ecdsa_secp256r1_sha256`, RFC 6979 nonces): the client checks the
+signature against the P-256 leaf and connects, and a key that is not the
+leaf's, or the wrong algorithm for it, is refused as configuration. -/
+private def checkEcdsaServer : IO Unit := do
+  let pem ← IO.FS.readFile "Test/Fixtures/Tls/ecdsa_server_cert.pem"
+  let certificates ← x509Result (TLS13.X509.PEM.decodeCertificates pem)
+  let serverConfig : Server.Config := {
+    serverRandom := fill 32 0x36
+    x25519Private := fill 32 0x47
+    certificateChain := #[certificates[0]!]
+    signingKey := hex "a6eed801fedf29bb85372696aefdceeec792ef1dd4f67dbb5b6fd6476e261fb1"
+    signingAlgorithm := .ecdsaP256Sha256
+  }
+  let client ← clientResult (Client.start {
+    clientRandom := fill 32 0x14
+    x25519Private := fill 32 0x25
+    serverName := some "localhost"
+  })
+  let serverFlight ← serverResult (Server.feed (Server.start serverConfig) client.wireBytes)
+  let clientDone ← clientResult (Client.feed client.state serverFlight.wireBytes)
+  expect "client verified the ECDSA P-256 CertificateVerify" clientDone.state.connected
+  let serverDone ← serverResult (Server.feed serverFlight.state clientDone.wireBytes)
+  expect "server connected with an ECDSA identity" serverDone.state.connected
+  let again ← serverResult (Server.feed (Server.start serverConfig) client.wireBytes)
+  expectEq "RFC 6979 signing is deterministic" again.wireBytes serverFlight.wireBytes
+  match Server.feed (Server.start { serverConfig with signingKey := fill 32 0x07 })
+      client.wireBytes with
+  | .error (.invalidConfig _) => pure ()
+  | _ => throw (IO.userError "server signed with a P-256 key that is not the leaf's")
+  match Server.feed (Server.start { serverConfig with signingAlgorithm := .ed25519 })
+      client.wireBytes with
+  | .error (.invalidConfig _) => pure ()
+  | _ => throw (IO.userError "server paired an Ed25519 algorithm with a P-256 leaf")
+
 def main : IO Unit := do
   let pem ← IO.FS.readFile "Test/Fixtures/Tls/server_cert.pem"
   let certificates ← x509Result (TLS13.X509.PEM.decodeCertificates pem)
@@ -436,6 +471,7 @@ def main : IO Unit := do
     serverDone.state
   checkUpdateKeys clientHello.state clientFinished.state serverFlight.state
     serverDone.state
+  checkEcdsaServer
 
   let request := "mainstream interop request".toUTF8
   let sealedRequest ← clientResult

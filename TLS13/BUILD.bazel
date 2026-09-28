@@ -13,6 +13,7 @@ lean_library(
         "KeySchedule.lean",
         "KeySchedule/Refinement.lean",
         "KeySchedule/Spec.lean",
+        "Rfc6979.lean",
         "X509.lean",
         "X509/Certificate.lean",
         "X509/ChannelBinding.lean",

@@ -29,6 +29,7 @@ lean_lib «TLS13» where
     `TLS13.KeySchedule,
     `TLS13.KeySchedule.Refinement,
     `TLS13.KeySchedule.Spec,
+    `TLS13.Rfc6979,
     `TLS13.X509,
   ]
 

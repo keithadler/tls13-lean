@@ -126,6 +126,20 @@ def main (args : List String) : IO Unit := do
       hex "471761974da12938977eca1b40cc0ea3d6e9c52897648a1661681e88fd31f4be"
     alpnProtocols := ["http/1.1"]
   }
+  -- TLS13_TEST_SERVER_ECDSA selects the P-256 identity, signed with
+  -- ecdsa_secp256r1_sha256 (RFC 9846 §9.1) and RFC 6979 nonces.
+  let config ← match ← IO.getEnv "TLS13_TEST_SERVER_ECDSA" with
+    | none => pure config
+    | some _ => do
+      let ecdsaPem ← IO.FS.readFile "Test/Fixtures/Tls/ecdsa_server_cert.pem"
+      match TLS13.X509.PEM.decodeCertificates ecdsaPem with
+      | .ok certificates =>
+          pure { config with
+            certificateChain := certificates
+            signingKey :=
+              hex "a6eed801fedf29bb85372696aefdceeec792ef1dd4f67dbb5b6fd6476e261fb1"
+            signingAlgorithm := .ecdsaP256Sha256 }
+      | .error error => throw (IO.userError s!"could not decode ECDSA certificate: {error}")
   let config ← match ← IO.getEnv "TLS13_TEST_CLIENT_CA" with
     | none => pure config
     | some path => do
