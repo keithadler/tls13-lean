@@ -215,6 +215,57 @@ private def checkExporters (clientBefore client : Client.State)
   | .error (.notConnected _) => pure ()
   | _ => throw (IO.userError "server exported before the client Finished")
 
+/-- Application-initiated KeyUpdate (RFC 9846 §4.6.3) in both roles: one that
+asks the peer to update too and one that does not, the reply, data under the
+new epochs both ways, and the refusals before the handshake completes, after
+close_notify, and at the 2^48-1 sending limit. -/
+private def checkUpdateKeys (clientBefore client : Client.State)
+    (serverBefore server : Server.State) : IO Unit := do
+  match Client.updateKeys clientBefore with
+  | .error (.notConnected _) => pure ()
+  | _ => throw (IO.userError "client updated keys before its handshake completed")
+  match Server.updateKeys serverBefore with
+  | .error (.notConnected _) => pure ()
+  | _ => throw (IO.userError "server updated keys before the client Finished")
+
+  let clientUpdate ← clientResult (Client.updateKeys client (requestPeer := true))
+  expectEq "client counts its sending epoch" clientUpdate.state.sendingKeyUpdates
+    (client.sendingKeyUpdates + 1)
+  let serverReply ← serverResult (Server.feed server clientUpdate.wireBytes)
+  expect "server answers update_requested" (!serverReply.wireBytes.isEmpty)
+  expectEq "server counts its reply" serverReply.state.sendingKeyUpdates
+    (server.sendingKeyUpdates + 1)
+  let clientSettled ← clientResult (Client.feed clientUpdate.state serverReply.wireBytes)
+  expect "no reply to update_not_requested" clientSettled.wireBytes.isEmpty
+
+  let message := "after a key update".toUTF8
+  let upstream ← clientResult (Client.sealApplication clientSettled.state message)
+  let serverGot ← serverResult (Server.feed serverReply.state upstream.wireBytes)
+  expectEq "client-to-server data under the updated epochs" serverGot.plaintext message
+  let downstream ← serverResult (Server.sealApplication serverGot.state message)
+  let clientGot ← clientResult (Client.feed upstream.state downstream.wireBytes)
+  expectEq "server-to-client data under the updated epochs" clientGot.plaintext message
+
+  let serverUpdate ← serverResult (Server.updateKeys downstream.state)
+  let clientAfter ← clientResult (Client.feed clientGot.state serverUpdate.wireBytes)
+  expect "a server update that requests nothing gets no reply" clientAfter.wireBytes.isEmpty
+  let later ← serverResult (Server.sealApplication serverUpdate.state message)
+  let clientLater ← clientResult (Client.feed clientAfter.state later.wireBytes)
+  expectEq "data after the server's own update" clientLater.plaintext message
+
+  match Client.updateKeys
+      { clientLater.state with sendingKeyUpdates := Client.maxSendingKeyUpdates } with
+  | .error .keyUpdateLimit => pure ()
+  | _ => throw (IO.userError "client updated keys past the sending limit")
+  match Server.updateKeys
+      { later.state with sendingKeyUpdates := Server.maxSendingKeyUpdates } with
+  | .error .keyUpdateLimit => pure ()
+  | _ => throw (IO.userError "server updated keys past the sending limit")
+  let closed ← clientResult (Client.closeNotify clientLater.state)
+  match Client.updateKeys closed.state with
+  | .error .connectionClosed => pure ()
+  | _ => throw (IO.userError "client updated keys after close_notify")
+
 def main : IO Unit := do
   let pem ← IO.FS.readFile "Test/Fixtures/Tls/server_cert.pem"
   let certificates ← x509Result (TLS13.X509.PEM.decodeCertificates pem)
@@ -382,6 +433,8 @@ def main : IO Unit := do
   expect "server connected after client Finished" serverDone.state.connected
 
   checkExporters clientHello.state clientFinished.state serverFlight.state
+    serverDone.state
+  checkUpdateKeys clientHello.state clientFinished.state serverFlight.state
     serverDone.state
 
   let request := "mainstream interop request".toUTF8

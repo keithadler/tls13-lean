@@ -109,6 +109,7 @@ inductive Error where
   | trailingHandshakeAfterFinished
   | notConnected (phase : Phase)
   | connectionClosed
+  | keyUpdateLimit
   | unsupportedExtension (extensionType : UInt16)
   | invalidExporterRequest (message : String)
   | internalState (message : String)
@@ -157,6 +158,7 @@ def render : Error → String
   | .notConnected phase =>
       s!"TLS connection is not ready for application data (waiting for {phase.render})"
   | .connectionClosed => "TLS connection is closed"
+  | .keyUpdateLimit => "TLS KeyUpdate limit of 2^48-1 sending epochs reached"
   | .unsupportedExtension extensionType =>
       s!"TLS server sent extension {extensionType} the client did not offer"
   | .invalidExporterRequest message => s!"TLS exporter: {message}"
@@ -755,10 +757,16 @@ def exportKeyingMaterial (state : State) (label context : ByteArray) (length : N
   pure (TLS13.KeySchedule.exporter secret label emptyTranscriptHash
     (HaclStar.sha256 context) length)
 
-private def sendKeyUpdateResponse (state : State) : Except Error (State × ByteArray) := do
+/-- Seal a KeyUpdate under the current write epoch, then move that epoch to the
+next traffic secret (RFC 9846 §4.6.3). `request` is `update_not_requested` for a
+reply to the peer's request; `updateKeys` sends either kind. At the 2^48-1
+sending-epoch limit it sends nothing. -/
+private def sendKeyUpdate (state : State)
+    (request : Handshake.KeyUpdateRequest := .updateNotRequested) :
+    Except Error (State × ByteArray) := do
   if state.sendingKeyUpdates < maxSendingKeyUpdates then
     let message ← liftHandshake <|
-      Handshake.encodeKeyUpdate .updateNotRequested
+      Handshake.encodeKeyUpdate request
     let writeKeys ← requireWriteKeys state
     let (advancedKeys, wireBytes) ←
       liftRecord (Record.«seal» writeKeys .handshake message.encoded)
@@ -769,6 +777,23 @@ private def sendKeyUpdateResponse (state : State) : Except Error (State × ByteA
     }, wireBytes)
   else
     pure (state, ByteArray.empty)
+
+/-- Send a KeyUpdate now (RFC 9846 §4.6.3), moving this side's write epoch to
+the next traffic secret. With `requestPeer` the peer must answer with its own
+KeyUpdate, which `feed` processes like any other. Refused before the handshake
+completes, after this side's `close_notify`, and at RFC 9846's 2^48-1 limit on
+the epochs one side may send. -/
+def updateKeys (state : State) (requestPeer : Bool := false) : Except Error Output := do
+  unless state.phase == .connected do
+    throw (.notConnected state.phase)
+  if state.localClosed then
+    throw .connectionClosed
+  unless state.sendingKeyUpdates < maxSendingKeyUpdates do
+    throw .keyUpdateLimit
+  let (state, wireBytes) ←
+    sendKeyUpdate state (if requestPeer then .updateRequested else .updateNotRequested)
+  pure { state, wireBytes }
+
 
 private def parseKeyUpdateForClient (message : Handshake.Message) :
     Except Error Handshake.KeyUpdate :=
@@ -796,7 +821,7 @@ def acceptKeyUpdate (state : State) (message : Handshake.Message) :
         -- promised that this write direction sends no more.
         pure (state, ByteArray.empty)
       else
-        sendKeyUpdateResponse state
+        sendKeyUpdate state
 
 /-! Reduction lemmas used to prove that key updates and transcript appends
 leave the handshake buffer untouched, which bounds the
@@ -815,17 +840,17 @@ private theorem appendTranscript_buffered (state : State)
     (appendTranscript state message).handshakeBuffered =
       state.handshakeBuffered := rfl
 
-private theorem sendKeyUpdateResponse_buffered {state next : State}
+private theorem sendKeyUpdate_buffered {state next : State}
     {wireBytes : ByteArray}
-    (h : sendKeyUpdateResponse state = .ok (next, wireBytes)) :
+    {request : Handshake.KeyUpdateRequest} (h : sendKeyUpdate state request = .ok (next, wireBytes)) :
   next.handshakeBuffered = state.handshakeBuffered := by
-  unfold sendKeyUpdateResponse at h
+  unfold sendKeyUpdate at h
   split at h
   case isFalse =>
     cases h
     rfl
   case isTrue =>
-    cases h1 : liftHandshake (Handshake.encodeKeyUpdate .updateNotRequested) with
+    cases h1 : liftHandshake (Handshake.encodeKeyUpdate request) with
     | error e => rw [h1, except_bind_error] at h; cases h
     | ok message =>
         rw [h1, except_bind_ok] at h
@@ -875,7 +900,7 @@ private theorem acceptKeyUpdate_buffered {state next : State}
                   split at h
                   · cases h
                     rfl
-                  · rw [sendKeyUpdateResponse_buffered h]
+                  · rw [sendKeyUpdate_buffered h]
 
 /-- Consume every complete handshake message the buffer holds, in phase order:
 EncryptedExtensions, Certificate, CertificateVerify, then the server Finished
@@ -1208,6 +1233,8 @@ inductive Op where
   | close
   /-- Seal a fatal alert; the caller discards the connection afterwards. -/
   | fatalAlert (description : UInt8)
+  /-- Send a KeyUpdate, asking the peer for one too when `requestPeer`. -/
+  | keyUpdate (requestPeer : Bool)
   deriving Inhabited
 
 def step (state : State) (op : Op) : Except Error Output :=
@@ -1216,6 +1243,7 @@ def step (state : State) (op : Op) : Except Error Output :=
   | .send plaintext => sealApplication state plaintext
   | .close => closeNotify state
   | .fatalAlert description => sealFatalAlert state description
+  | .keyUpdate requestPeer => updateKeys state requestPeer
 
 /-- Drive a sequence of operations from `state`, concatenating produced wire
 bytes and plaintext in order. -/

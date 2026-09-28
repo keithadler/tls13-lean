@@ -47,12 +47,12 @@ private partial def completeHandshake (socket : TCP.Socket.Client) (state : Clie
         completeHandshake socket output.state
 
 private partial def readResponse (socket : TCP.Socket.Client) (state : Client.State)
-    (received : ByteArray) : IO ByteArray := do
+    (received : ByteArray) : IO (ByteArray × Client.State) := do
   if state.peerClosed || received.size > 65536 then
-    pure received
+    pure (received, state)
   else
     match ← (socket.recv? 16384).block with
-    | none => pure received
+    | none => pure (received, state)
     | some chunk =>
         match Client.feed state chunk with
         | .error error => throw (IO.userError s!"TLS client: {error}")
@@ -97,12 +97,20 @@ def main (args : List String) : IO Unit := do
         ByteArray.empty 32 with
     | .ok material => logLine s!"EXPORTER {HaclStar.Hex.encode material}"
     | .error error => logLine s!"EXPORTER-ERROR {error}"
+    -- RFC 9846 §4.6.3: update our sending epoch and ask the server to update
+    -- its own, then send the request under the new keys.
+    let updated ← match Client.updateKeys connected (requestPeer := true) with
+      | .ok output => pure output
+      | .error error => throw (IO.userError s!"TLS KeyUpdate: {error}")
+    sendBytes socket updated.wireBytes
+    let readSecret := connected.readKeys?.map (·.secret)
     let request := "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".toUTF8
-    let sent ← match Client.sealApplication connected request with
+    let sent ← match Client.sealApplication updated.state request with
       | .ok output => pure output
       | .error error => throw (IO.userError s!"TLS application request: {error}")
     sendBytes socket sent.wireBytes
-    let response ← readResponse socket sent.state ByteArray.empty
+    let (response, final) ← readResponse socket sent.state ByteArray.empty
+    logLine s!"PEER_UPDATED {final.readKeys?.map (·.secret) != readSecret}"
     let text := String.fromUTF8? response |>.getD ""
     logLine s!"RESPONSE {(text.splitOn "\r\n").headD ""}"
   finally

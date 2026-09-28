@@ -180,10 +180,10 @@ private theorem processAlert_write {state next : State} {fragment : ByteArray}
 
 /-- A KeyUpdate response seals its message under the *old* epoch, as RFC 8446
 §7.2 requires, and only then rolls the write secret forward. -/
-private theorem sendKeyUpdateResponse_write {state next : State} {wire : ByteArray}
-    (h : sendKeyUpdateResponse state = .ok (next, wire)) :
+private theorem sendKeyUpdate_write {state next : State} {wire : ByteArray}
+    {request : Handshake.KeyUpdateRequest} (h : sendKeyUpdate state request = .ok (next, wire)) :
     WriteEffect state next := by
-  unfold sendKeyUpdateResponse at h
+  unfold sendKeyUpdate at h
   split at h
   · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
     obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
@@ -198,10 +198,10 @@ private theorem sendKeyUpdateResponse_write {state next : State} {wire : ByteArr
   · cases h
     exact Record.Extends.refl _
 
-private theorem sendKeyUpdateResponse_readKeys {state next : State}
-    {wire : ByteArray} (h : sendKeyUpdateResponse state = .ok (next, wire)) :
+private theorem sendKeyUpdate_readKeys {state next : State}
+    {wire : ByteArray} {request : Handshake.KeyUpdateRequest} (h : sendKeyUpdate state request = .ok (next, wire)) :
   next.readKeys? = state.readKeys? := by
-  unfold sendKeyUpdateResponse at h
+  unfold sendKeyUpdate at h
   split at h
   · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
     obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
@@ -226,7 +226,7 @@ private theorem acceptKeyUpdate_write {state next : State}
   · simp only [] at h
     split at h
     · cases h; exact Record.Extends.refl _
-    · have hw := sendKeyUpdateResponse_write h
+    · have hw := sendKeyUpdate_write h
       exact hw
 
 
@@ -743,6 +743,22 @@ theorem feed_write {state : State} {chunk : ByteArray} {out : Output}
     exact feedWithFailure_write hfeed
   · cases h
 
+/-- `updateKeys` is exactly one `sendKeyUpdate`, and returns no plaintext. -/
+private theorem updateKeys_sends {state : State} {requestPeer : Bool} {out : Output}
+    (h : updateKeys state requestPeer = .ok out) :
+    (∃ request, sendKeyUpdate state request = .ok (out.state, out.wireBytes)) ∧
+      out.plaintext = ByteArray.empty := by
+  unfold updateKeys at h
+  simp only [pure_bind] at h
+  obtain ⟨_, h⟩ := unless_ok h
+  obtain ⟨_, h⟩ := if_throw_ok h
+  split at h
+  · obtain ⟨pair, hs, h⟩ := except_bind_ok_inv h
+    obtain ⟨st, w⟩ := pair
+    cases h
+    exact ⟨⟨_, hs⟩, rfl⟩
+  · cases h
+
 theorem step_write {state : State} {op : Op} {out : Output}
     (h : step state op = .ok out) : WriteEffect state out.state := by
   unfold step at h
@@ -751,6 +767,8 @@ theorem step_write {state : State} {op : Op} {out : Output}
   · exact sealApplication_write h
   · exact closeNotify_write h
   · exact sealFatalAlert_write h
+  · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
+    exact sendKeyUpdate_write hs
 
 /-- **Every record a run protects is threaded through the engine's own state.**
 -/
@@ -1042,10 +1060,10 @@ private theorem processAlert_wellFormed {state next : State} {fragment : ByteArr
       exact hinv
     · cases h
 
-private theorem sendKeyUpdateResponse_wellFormed {state next : State}
-    {wire : ByteArray} (h : sendKeyUpdateResponse state = .ok (next, wire))
+private theorem sendKeyUpdate_wellFormed {state next : State}
+    {wire : ByteArray} {request : Handshake.KeyUpdateRequest} (h : sendKeyUpdate state request = .ok (next, wire))
     (hinv : state.WellFormed) : next.WellFormed := by
-  unfold sendKeyUpdateResponse at h
+  unfold sendKeyUpdate at h
   split at h
   · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
     obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
@@ -1077,7 +1095,7 @@ private theorem acceptKeyUpdate_wellFormed {state next : State}
     · cases h
       exact wellFormed_transfer hinv rfl (.inl rfl)
         (.inr ⟨⟨_, rfl⟩, hsome⟩) rfl rfl rfl rfl
-    · exact sendKeyUpdateResponse_wellFormed h
+    · exact sendKeyUpdate_wellFormed h
         (wellFormed_transfer hinv rfl (.inl rfl)
           (.inr ⟨⟨_, rfl⟩, hsome⟩) rfl rfl rfl rfl)
 
@@ -1352,6 +1370,8 @@ theorem step_wellFormed {state : State} {op : Op} {out : Output}
   · exact sealApplication_wellFormed h hinv
   · exact closeNotify_wellFormed h hinv
   · exact sealFatalAlert_wellFormed h hinv
+  · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
+    exact sendKeyUpdate_wellFormed hs hinv
 
 /-- **The invariant survives a whole run.** -/
 theorem run_wellFormed {ops : List Op} : ∀ {state : State} {out : Output},
@@ -1390,6 +1410,23 @@ theorem sealApplication_connected {state : State} {plaintext : ByteArray}
   obtain ⟨hp, h⟩ := unless_ok h
   obtain ⟨hcl, h⟩ := if_throw_ok h
   exact ⟨phase_eq_of_beq hp, by simpa using hcl⟩
+
+/-- **An application-initiated KeyUpdate is sent only on an open, established
+connection below the sending limit** (RFC 9846 §4.6.3, §4.7.3). -/
+theorem updateKeys_connected {state : State} {requestPeer : Bool} {out : Output}
+    (h : updateKeys state requestPeer = .ok out) :
+    state.phase = .connected ∧ state.localClosed = false ∧
+      state.sendingKeyUpdates < maxSendingKeyUpdates := by
+  unfold updateKeys at h
+  simp only [pure_bind] at h
+  obtain ⟨hp, h⟩ := unless_ok h
+  obtain ⟨hcl, h⟩ := if_throw_ok h
+  split at h
+  · rename_i hlt
+    exact ⟨phase_eq_of_beq hp, by simpa using hcl, by simpa using hlt⟩
+  · cases h
+
+
 
 /-- **`close_notify` is sent only by an established connection.** -/
 theorem closeNotify_connected {state : State} {out : Output}
@@ -1448,10 +1485,10 @@ private theorem processAlert_phase {state next : State} {fragment : ByteArray}
       rfl
     · cases h
 
-private theorem sendKeyUpdateResponse_phase {state next : State} {wire : ByteArray}
-    (h : sendKeyUpdateResponse state = .ok (next, wire)) :
+private theorem sendKeyUpdate_phase {state next : State} {wire : ByteArray}
+    {request : Handshake.KeyUpdateRequest} (h : sendKeyUpdate state request = .ok (next, wire)) :
   next.phase = state.phase := by
-  unfold sendKeyUpdateResponse at h
+  unfold sendKeyUpdate at h
   split at h
   · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
     obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
@@ -1476,7 +1513,7 @@ private theorem acceptKeyUpdate_phase {state next : State}
   · simp only [] at h
     split at h
     · cases h; rfl
-    · have hp := sendKeyUpdateResponse_phase h
+    · have hp := sendKeyUpdate_phase h
       exact hp
 
 /-- Post-handshake messages do not leave `connected`: the only ones the engine
@@ -1835,6 +1872,7 @@ theorem step_plaintext_connected {state : State} {op : Op} {out : Output}
   · rw [sealApplication_plaintext h] at hne; cases hne
   · rw [closeNotify_plaintext h] at hne; cases hne
   · rw [sealFatalAlert_plaintext h] at hne; cases hne
+  · rw [(updateKeys_sends h).2] at hne; cases hne
 
 theorem step_connected {state : State} {op : Op} {out : Output}
     (h : step state op = .ok out) (hc : state.phase = .connected) :
@@ -1845,6 +1883,8 @@ theorem step_connected {state : State} {op : Op} {out : Output}
   · rw [sealApplication_phase h]; exact hc
   · rw [closeNotify_phase h]; exact hc
   · rw [sealFatalAlert_phase h]; exact hc
+  · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
+    rw [sendKeyUpdate_phase hs]; exact hc
 
 theorem run_connected {ops : List Op} : ∀ {state : State} {out : Output},
     run state ops = .ok out → state.phase = .connected →
@@ -1942,7 +1982,7 @@ theorem acceptKeyUpdate_epoch {state next : State}
   · simp only [] at h
     split at h
     · cases h; rfl
-    · rw [sendKeyUpdateResponse_readKeys h]
+    · rw [sendKeyUpdate_readKeys h]
 
 /-- **The RFC 9846 sending-generation limit is inductive.** Starting at or
 below the `2^48 - 1` cap, accepting a KeyUpdate cannot move the client above
@@ -1965,7 +2005,7 @@ theorem acceptKeyUpdate_sendingKeyUpdates_le {state next : State}
     split at h
     · cases h
       exact hbound
-    · unfold sendKeyUpdateResponse at h
+    · unfold sendKeyUpdate at h
       simp only [] at h
       split at h
       · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
@@ -2001,7 +2041,7 @@ theorem acceptKeyUpdate_response_suppressed_at_limit {state next : State}
     split at h
     · cases h
       exact ⟨rfl, rfl, rfl⟩
-    · unfold sendKeyUpdateResponse at h
+    · unfold sendKeyUpdate at h
       simp only [] at h
       split at h
       · omega
@@ -2028,9 +2068,9 @@ theorem acceptKeyUpdate_response_increments {state next : State}
     split at h
     · cases h
       exact absurd rfl hemitted
-    · change sendKeyUpdateResponse
+    · change sendKeyUpdate
         ({ state with readKeys? := some updatedReadKeys }) = .ok (next, wire) at h
-      unfold sendKeyUpdateResponse at h
+      unfold sendKeyUpdate at h
       split at h
       · rename_i hbelow
         obtain ⟨_, _, h⟩ := except_bind_ok_inv h
@@ -2417,10 +2457,10 @@ theorem exportKeyingMaterial_connected {state : State} {label context out : Byte
   obtain ⟨hc, _⟩ := unless_ok h
   exact phase_eq_of_beq hc
 
-private theorem sendKeyUpdateResponse_handshakeSecret {state next : State}
-    {wire : ByteArray} (h : sendKeyUpdateResponse state = .ok (next, wire)) :
+private theorem sendKeyUpdate_handshakeSecret {state next : State}
+    {wire : ByteArray} {request : Handshake.KeyUpdateRequest} (h : sendKeyUpdate state request = .ok (next, wire)) :
     next.handshakeSecret? = state.handshakeSecret? := by
-  unfold sendKeyUpdateResponse at h
+  unfold sendKeyUpdate at h
   split at h
   · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
     obtain ⟨keys, _, h⟩ := except_bind_ok_inv h
@@ -2445,7 +2485,7 @@ private theorem acceptKeyUpdate_handshakeSecret {state next : State}
   · simp only [] at h
     split at h
     · cases h; rfl
-    · rw [sendKeyUpdateResponse_handshakeSecret h]
+    · rw [sendKeyUpdate_handshakeSecret h]
 
 /-- **The client's whole encrypted server flight installs the RFC 8446 §7.1
 application epochs.** `processHandshakeBuffer` consumes EncryptedExtensions,
@@ -2544,6 +2584,37 @@ theorem processHandshakeBuffer_keySchedule {H : Spec.Hkdf} (hi : Implements H)
       | exact hsize
       | exact hbuf
 
+private theorem sendKeyUpdate_keySchedule {H : Spec.Hkdf} (hi : Implements H)
+    {state next : State} {request : Handshake.KeyUpdateRequest} {wire : ByteArray}
+    (h : sendKeyUpdate state request = .ok (next, wire))
+    (hlt : state.sendingKeyUpdates < maxSendingKeyUpdates) :
+    ∃ keys keys', state.writeKeys? = some keys ∧ next.writeKeys? = some keys' ∧
+      Record.TrafficKeys.DerivedFrom H keys' (Spec.nextTrafficSecret H keys.secret) ∧
+      next.sendingKeyUpdates = state.sendingKeyUpdates + 1 := by
+  unfold sendKeyUpdate at h
+  rw [if_pos hlt] at h
+  obtain ⟨_, _, h⟩ := except_bind_ok_inv h
+  obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
+  obtain ⟨sealed, hseal, h⟩ := except_bind_ok_inv h
+  obtain ⟨advancedKeys, wireBytes⟩ := sealed
+  obtain ⟨updatedKeys, hu, h⟩ := except_bind_ok_inv h
+  cases h
+  have hupd := Record.TrafficKeys.update_spec hi (liftRecord_ok hu)
+  rw [Record.seal_secret_eq (liftRecord_ok hseal)] at hupd
+  exact ⟨keys, updatedKeys, requireWriteKeys_ok hk, rfl, hupd, rfl⟩
+
+/-- **An application-initiated KeyUpdate installs the RFC 9846 §7.2 successor
+write epoch**: `HKDF-Expand-Label(old, "traffic upd", "", Hash.length)`, with
+its §7.3 key, IV and a zero sequence number, and counts one more sending epoch.
+The KeyUpdate itself is protected under the old epoch (`step_write`). -/
+theorem updateKeys_keySchedule {H : Spec.Hkdf} (hi : Implements H) {state : State}
+    {requestPeer : Bool} {out : Output} (h : updateKeys state requestPeer = .ok out) :
+    ∃ keys keys', state.writeKeys? = some keys ∧ out.state.writeKeys? = some keys' ∧
+      Record.TrafficKeys.DerivedFrom H keys' (Spec.nextTrafficSecret H keys.secret) ∧
+      out.state.sendingKeyUpdates = state.sendingKeyUpdates + 1 := by
+  obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
+  exact sendKeyUpdate_keySchedule hi hs (updateKeys_connected h).2.2
+
 /-- **A KeyUpdate installs the RFC 8446 §7.2 successor epoch.** The new read
 epoch's secret is `HKDF-Expand-Label(old, "traffic upd", "", Hash.length)` —
 empty context, not a transcript hash — and its key, IV and sequence number are
@@ -2570,7 +2641,7 @@ theorem acceptKeyUpdate_keySchedule {H : Spec.Hkdf} (hi : Implements H)
   · simp only [] at h
     split at h
     · cases h; rfl
-    · rw [sendKeyUpdateResponse_readKeys h]
+    · rw [sendKeyUpdate_readKeys h]
 
 /-! ## A finite AEAD nonce trace refined by the key schedule
 
@@ -2765,10 +2836,10 @@ The reciprocal KeyUpdate is sealed under the old epoch — so that record is
 accounted for in the old epoch's nonce budget — and only then is the traffic
 secret rolled forward, to `HKDF-Expand-Label(old, "traffic upd", "", 32)`, which
 is a strictly later node of the schedule. -/
-private theorem sendKeyUpdateResponse_epochs {H : Spec.Hkdf} (hi : Implements H)
+private theorem sendKeyUpdate_epochs {H : Spec.Hkdf} (hi : Implements H)
     {state next : State} {wire : ByteArray}
-    (h : sendKeyUpdateResponse state = .ok (next, wire)) : SpecEffect H state next := by
-  unfold sendKeyUpdateResponse at h
+    {request : Handshake.KeyUpdateRequest} (h : sendKeyUpdate state request = .ok (next, wire)) : SpecEffect H state next := by
+  unfold sendKeyUpdate at h
   split at h
   · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
     obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
@@ -2808,7 +2879,7 @@ private theorem acceptKeyUpdate_epochs {H : Spec.Hkdf} (hi : Implements H)
     split at h
     · cases h
       exact SpecEffect.within rfl (Record.WithinEpoch.refl _)
-    · have hw := sendKeyUpdateResponse_epochs hi h
+    · have hw := sendKeyUpdate_epochs hi h
       exact SpecEffect.of_eq hw rfl rfl
 
 /-- **Accepting the ServerHello installs the connection's first write epoch.**
@@ -3169,6 +3240,8 @@ theorem step_epochs {H : Spec.Hkdf} (hi : Implements H) {state : State} {op : Op
   · exact sealApplication_epochs h
   · exact closeNotify_epochs h
   · exact sealFatalAlert_epochs h
+  · obtain ⟨⟨_, hs⟩, -⟩ := updateKeys_sends h
+    exact sendKeyUpdate_epochs hi hs
 
 /-- **Every epoch a run installs is a strictly later node of the RFC 8446 §7.1 /
 §7.2 key schedule than the one it replaces.** -/
@@ -3323,12 +3396,12 @@ private theorem processAlert_rolled {H : Spec.Hkdf} {state next : State}
       exact RolledEpochs.refl _
     · cases h
 
-private theorem sendKeyUpdateResponse_rolled {H : Spec.Hkdf} (hi : Implements H)
+private theorem sendKeyUpdate_rolled {H : Spec.Hkdf} (hi : Implements H)
     {state next : State} {wire : ByteArray}
-    (h : sendKeyUpdateResponse state = .ok (next, wire)) :
+    {request : Handshake.KeyUpdateRequest} (h : sendKeyUpdate state request = .ok (next, wire)) :
     RolledEpochs H state next := by
-  have hread := sendKeyUpdateResponse_readKeys h
-  unfold sendKeyUpdateResponse at h
+  have hread := sendKeyUpdate_readKeys h
+  unfold sendKeyUpdate at h
   split at h
   · obtain ⟨_, _, h⟩ := except_bind_ok_inv h
     obtain ⟨keys, hk, h⟩ := except_bind_ok_inv h
@@ -3363,7 +3436,7 @@ private theorem acceptKeyUpdate_rolled {H : Spec.Hkdf} (hi : Implements H)
   · simp only [] at h
     split at h
     · cases h; exact hstep
-    · exact hstep.trans (sendKeyUpdateResponse_rolled hi h)
+    · exact hstep.trans (sendKeyUpdate_rolled hi h)
 
 /-- In `connected` the only post-handshake messages the engine accepts are
 NewSessionTicket, which touches no key state, and KeyUpdate, which rolls the

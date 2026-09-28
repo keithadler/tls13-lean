@@ -343,11 +343,12 @@ timeout 30 "${CLIENT_BIN}" "${PORT}" "${PKI}/ca.pem" --p256-hrr >"${log}" 2>&1
 rc=$?
 wait "${OPENSSL_PID}" 2>/dev/null || true
 if [[ ${rc} -eq 0 ]] && grep -q '^NEGOTIATED retried=true' "${log}" \
-    && grep -q '^RESPONSE HTTP/1.0 200' "${log}"; then
-  note "PASS lean client HelloRetryRequest to openssl s_server ($(grep '^NEGOTIATED' "${log}"))"
+    && grep -q '^RESPONSE HTTP/1.0 200' "${log}" \
+    && grep -q '^PEER_UPDATED true' "${log}"; then
+  note "PASS lean client HelloRetryRequest and KeyUpdate with openssl s_server ($(grep '^NEGOTIATED' "${log}"), server answered update_requested)"
 else
   dump_case client-hrr "${log}"
-  fail "client-hrr: Lean client did not complete a retried handshake (rc=${rc})"
+  fail "client-hrr: Lean client did not complete a retried handshake, or s_server did not answer its KeyUpdate (rc=${rc})"
 fi
 
 # The same retried handshake, with OpenSSL exporting keying material server

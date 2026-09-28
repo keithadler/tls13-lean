@@ -162,8 +162,18 @@ def main (args : List String) : IO Unit := do
       -- turning this interoperability harness into a full HTTP server.
       let response :=
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".toUTF8
+      -- RFC 9846 §4.6.3: move to a new sending epoch, asking the client to
+      -- do the same, before the response; each client must read the page
+      -- under the updated keys.
+      let updated ←
+        match Server.updateKeys connected (requestPeer := true) with
+        | .error error => throw (IO.userError s!"TLS KeyUpdate: {error}")
+        | .ok output =>
+            sendBytes client output.wireBytes
+            logLine "KEYUPDATE sent update_requested"
+            pure output.state
       let responded ←
-        match Server.sealApplication connected response with
+        match Server.sealApplication updated response with
         | .error error => throw (IO.userError s!"TLS application response: {error}")
         | .ok output =>
             sendBytes client output.wireBytes

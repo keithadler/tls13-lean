@@ -379,9 +379,12 @@ Implemented and negotiated:
   `update_requested` under the old write epoch before advancing it. Responses
   stop at RFC 9846's `2^48 - 1` sending-epoch limit;
   the receiving direction is intentionally not capped. Key-changing messages
-  must finish their protected record. The API does not initiate a
-  proactive `update_requested` KeyUpdate, so there is no outstanding-request
-  state to manage. It also responds per requested record while processing a
+  must finish their protected record. Either role can also update on its own:
+  `updateKeys state (requestPeer := …)` (and `Op.keyUpdate`) seals a KeyUpdate
+  under the old epoch and moves to §7.2's successor
+  (`updateKeys_keySchedule`), only when connected, open and below the limit
+  (`updateKeys_connected`). A peer's reply is an ordinary KeyUpdate, so there
+  is no outstanding-request state to manage. It also responds per requested record while processing a
   feed; a batch containing several requested KeyUpdates is not collapsed into
   one deferred response.
 - **Keying material exporters** (RFC 9846 §7.5, RFC 5705's interface):
@@ -553,7 +556,7 @@ test binary is built, so a violation is a red target, not a stale README:
 | --- | --- |
 | `//HaclStar:haclstar_assurance` | The trusted C boundary: the 16 `@[extern] opaque` bindings are accounted for and no proof hole exists in the FFI package |
 | `//TLS13:tls13_assurance` | 25 principal theorems — the RFC 8446 §7.1 derivation tree as data (`Derived.tree_rfc8446`, `Label.text_rfc8446`), the `HkdfLabel` wire image byte for byte, and the refinement of `expandLabel`/`deriveSecret`/Early/Handshake/Main (compatibility theorem identifier `masterSecret_spec`)/`Derive-Secret`; plus DER exact-slice retention, decoder injectivity/idempotence/trailing-data rejection, `Certificate.decode_tbs_encoded`, `Chain.checkIssuer_verifies`, and `Chain.validate_leaf_keyUsage` |
-| `//Tls:tls_assurance` | 97 principal theorems — finite write traces (`WriteRun.nodup`, `AeadWriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, the schedule-refined `run_nonce_trace_spec`/`start_run_nonce_trace_spec`, `run_epochs`, and nonce/sequence injectivity), record conservation, the exact `TLSInnerPlaintext` bound, and seal/open inversion; ClientHello canonicity and body injectivity; the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary); and the state-machine transition and invariant laws, including KeyUpdate limit/error behavior, no output after local closure, directional peer closure, both directions of the connected-only application-data rule, and both engines' no-epoch-before-the-first-flight clauses |
+| `//Tls:tls_assurance` | 101 principal theorems — finite write traces (`WriteRun.nodup`, `AeadWriteRun.nodup`, both `run_nonce_nodup`/`feed_nonce_nodup`, the schedule-refined `run_nonce_trace_spec`/`start_run_nonce_trace_spec`, `run_epochs`, and nonce/sequence injectivity), record conservation, the exact `TLSInnerPlaintext` bound, and seal/open inversion; ClientHello canonicity and body injectivity; the §7.3/§7.2/§4.4.4 record-layer and Finished derivations and the engines' §7.1 epoch installations (including `Tls.Client.feed_keySchedule`, the linkage stated at the `feed` boundary); and the state-machine transition and invariant laws, including KeyUpdate limit/error behavior, no output after local closure, directional peer closure, both directions of the connected-only application-data rule, and both engines' no-epoch-before-the-first-flight clauses |
 
 Each target also scans every constant of the full 28-module first-party closure
 (`HaclStar`, `TLS13`, `Tls`): nothing may reach
